@@ -7,22 +7,25 @@ import {
   RenewInput,
   ReportDeliveryInput,
   SubmitCommandInput,
-} from '../domain/types.js';
+} from "../domain/types.js";
 import {
   claimCommand,
   confirmCommand,
   createPendingCommand,
   expireLease,
+  recordRejectedLeaseOperation,
   renewLease,
   reportDelivery,
   Clock,
   IdGenerator,
-} from '../domain/stateMachine.js';
+} from "../domain/stateMachine.js";
 import {
   CommandNotFoundError,
+  DomainError,
+  InvalidLeaseError,
   NoClaimableTaskError,
-} from '../domain/errors.js';
-import { CommandRepository, EventStore, UnitOfWork } from './ports.js';
+} from "../domain/errors.js";
+import { CommandRepository, EventStore, UnitOfWork } from "./ports.js";
 
 export class CommandService {
   constructor(
@@ -30,13 +33,22 @@ export class CommandService {
     private readonly commands: CommandRepository,
     private readonly events: EventStore,
     private readonly clock: Clock,
-    private readonly idGen: IdGenerator
+    private readonly idGen: IdGenerator,
   ) {}
 
-  async submit(input: SubmitCommandInput): Promise<{ command: Command; created: boolean }> {
+  async submit(
+    input: SubmitCommandInput,
+  ): Promise<{ command: Command; created: boolean }> {
     return this.uow.transaction(async (tx) => {
-      const existing = await tx.commands.findByIdempotencyKey(input.idempotencyKey);
-      const decision = createPendingCommand(input, existing, this.idGen, this.clock);
+      const existing = await tx.commands.findByIdempotencyKey(
+        input.idempotencyKey,
+      );
+      const decision = createPendingCommand(
+        input,
+        existing,
+        this.idGen,
+        this.clock,
+      );
       if (existing) {
         return { command: existing, created: false };
       }
@@ -46,46 +58,118 @@ export class CommandService {
   }
 
   async claim(input: ClaimInput): Promise<Command> {
-    return this.uow.transaction(async (tx) => {
+    let rejection: InvalidLeaseError | null = null;
+    const result = await this.uow.transaction(async (tx) => {
       const now = this.clock.now();
       const candidate = await tx.commands.findClaimable(now, input.deviceId);
       if (!candidate) {
         throw new NoClaimableTaskError();
       }
-      const decision = claimCommand(candidate, input, this.idGen, this.clock);
-      await tx.commands.save(decision.command, decision.events);
-      return decision.command;
+      try {
+        const decision = claimCommand(candidate, input, this.idGen, this.clock);
+        await tx.commands.save(decision.command, decision.events);
+        return decision.command;
+      } catch (err) {
+        if (err instanceof InvalidLeaseError) {
+          const event = recordRejectedLeaseOperation(
+            candidate,
+            {
+              operation: "claim-contention",
+              leaseId: candidate.currentLeaseId ?? input.gatewayId,
+              gatewayId: input.gatewayId,
+              reason: err.message,
+            },
+            this.idGen,
+            this.clock,
+          );
+          await tx.events.append([event]);
+          rejection = err;
+          return candidate;
+        }
+        throw err;
+      }
     });
+    if (rejection) throw rejection;
+    return result;
   }
 
   async renew(input: RenewInput): Promise<Command> {
-    return this.uow.transaction(async (tx) => {
+    let rejection: DomainError | null = null;
+    const result = await this.uow.transaction(async (tx) => {
       const command = await tx.commands.findByCommandId(input.commandId);
       if (!command) throw new CommandNotFoundError(input.commandId);
-      const decision = renewLease(command, input, this.idGen, this.clock);
-      await tx.commands.save(decision.command, decision.events);
-      return decision.command;
+      try {
+        const decision = renewLease(command, input, this.idGen, this.clock);
+        await tx.commands.save(decision.command, decision.events);
+        return decision.command;
+      } catch (err) {
+        if (err instanceof DomainError) {
+          const event = recordRejectedLeaseOperation(
+            command,
+            {
+              operation: "renew",
+              leaseId: input.leaseId,
+              gatewayId: input.gatewayId,
+              reason: err.message,
+            },
+            this.idGen,
+            this.clock,
+          );
+          await tx.events.append([event]);
+          rejection = err;
+          return command;
+        }
+        throw err;
+      }
     });
+    if (rejection) throw rejection;
+    return result;
   }
 
   async reportDelivery(input: ReportDeliveryInput): Promise<Command> {
-    return this.uow.transaction(async (tx) => {
+    let rejection: DomainError | null = null;
+    const result = await this.uow.transaction(async (tx) => {
       const command = await tx.commands.findByCommandId(input.commandId);
       if (!command) throw new CommandNotFoundError(input.commandId);
-      const decision = reportDelivery(command, input, this.idGen, this.clock);
-      await tx.commands.save(decision.command, decision.events);
-      return decision.command;
+      try {
+        const decision = reportDelivery(command, input, this.idGen, this.clock);
+        await tx.commands.save(decision.command, decision.events);
+        return decision.command;
+      } catch (err) {
+        if (err instanceof DomainError) {
+          const event = recordRejectedLeaseOperation(
+            command,
+            {
+              operation: "report-delivery",
+              leaseId: input.leaseId,
+              gatewayId: input.gatewayId,
+              reason: err.message,
+            },
+            this.idGen,
+            this.clock,
+          );
+          await tx.events.append([event]);
+          rejection = err;
+          return command;
+        }
+        throw err;
+      }
     });
+    if (rejection) throw rejection;
+    return result;
   }
 
-  async confirm(input: ConfirmInput): Promise<{ command: Command; accepted: boolean }> {
+  async confirm(
+    input: ConfirmInput,
+  ): Promise<{ command: Command; accepted: boolean }> {
     return this.uow.transaction(async (tx) => {
       const command = await tx.commands.findByCommandId(input.commandId);
       if (!command) throw new CommandNotFoundError(input.commandId);
       const before = command.status;
       const decision = confirmCommand(command, input, this.idGen, this.clock);
       await tx.commands.save(decision.command, decision.events);
-      const accepted = decision.command.status === 'SUCCEEDED' && before !== 'SUCCEEDED';
+      const accepted =
+        decision.command.status === "SUCCEEDED" && before !== "SUCCEEDED";
       return { command: decision.command, accepted };
     });
   }
@@ -98,7 +182,10 @@ export class CommandService {
       for (const command of expired) {
         const outcome = expireLease(command, this.idGen, this.clock);
         if (outcome) {
-          await tx.commands.save(outcome.decision.command, outcome.decision.events);
+          await tx.commands.save(
+            outcome.decision.command,
+            outcome.decision.events,
+          );
           results.push(outcome.result);
         }
       }

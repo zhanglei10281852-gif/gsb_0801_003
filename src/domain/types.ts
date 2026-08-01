@@ -1,8 +1,4 @@
-export type CommandStatus =
-  | 'PENDING'
-  | 'CLAIMED'
-  | 'SUCCEEDED'
-  | 'FAILED';
+export type CommandStatus = "PENDING" | "CLAIMED" | "SUCCEEDED" | "FAILED";
 
 export interface CommandPayload {
   deviceId: string;
@@ -28,16 +24,17 @@ export interface Command {
 }
 
 export type EventType =
-  | 'CommandSubmitted'
-  | 'CommandClaimed'
-  | 'LeaseRenewed'
-  | 'DeliveryReported'
-  | 'DeviceConfirmed'
-  | 'CommandSucceeded'
-  | 'LeaseExpired'
-  | 'CommandReclaimed'
-  | 'CommandFailed'
-  | 'StaleMessageRejected';
+  | "CommandSubmitted"
+  | "CommandClaimed"
+  | "LeaseRenewed"
+  | "DeliveryReported"
+  | "DeviceConfirmed"
+  | "CommandSucceeded"
+  | "LeaseExpired"
+  | "CommandReclaimed"
+  | "CommandFailed"
+  | "LeaseOperationRejected"
+  | "StaleMessageRejected";
 
 export interface CommandEvent {
   eventId: string;

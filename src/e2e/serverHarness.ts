@@ -1,8 +1,8 @@
-import { spawn, ChildProcess } from 'node:child_process';
-import path from 'node:path';
-import fs from 'node:fs';
-import os from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { spawn, ChildProcess } from "node:child_process";
+import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
+import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,70 +14,123 @@ export interface ServerHandle {
   stop: () => Promise<void>;
 }
 
-export async function startCompiledServer(port?: number): Promise<ServerHandle> {
-  const chosenPort = port ?? 3000 + Math.floor(Math.random() * 1000);
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'edge-cmd-e2e-'));
-  const dbPath = path.join(tmpDir, 'commands.db');
-  const distEntry = path.join(__dirname, '..', 'index.js');
+export interface ManagedServer {
+  port: number;
+  baseUrl: string;
+  dbPath: string;
+  start: () => Promise<void>;
+  stop: () => Promise<void>;
+  restart: () => Promise<void>;
+  killAbruptly: () => Promise<void>;
+}
 
-  if (!fs.existsSync(distEntry)) {
+function distEntry(): string {
+  const entry = path.join(__dirname, "..", "index.js");
+  if (!fs.existsSync(entry)) {
     throw new Error(
-      `Compiled server not found at ${distEntry}. Run "npm run build" first.`
+      `Compiled server not found at ${entry}. Run "npm run build" first.`,
     );
   }
+  return entry;
+}
 
-  const child: ChildProcess = spawn(process.execPath, [distEntry], {
-    env: {
-      ...process.env,
-      PORT: String(chosenPort),
-      DB_PATH: dbPath,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+export async function startCompiledServer(
+  port?: number,
+): Promise<ServerHandle> {
+  const chosenPort = port ?? 3000 + Math.floor(Math.random() * 1000);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "edge-cmd-e2e-"));
+  const dbPath = path.join(tmpDir, "commands.db");
+  const child = await spawnAndWait(chosenPort, dbPath);
 
-  let stdout = '';
-  let stderr = '';
-  child.stdout?.on('data', (d: Buffer) => {
-    stdout += d.toString();
-  });
-  child.stderr?.on('data', (d: Buffer) => {
-    stderr += d.toString();
-  });
+  const stop = () => killChild(child).then(() => cleanupDir(tmpDir));
 
-  const baseUrl = `http://localhost:${chosenPort}`;
-  const healthUrl = `${baseUrl}/api/v1/health`;
+  return {
+    port: chosenPort,
+    baseUrl: `http://localhost:${chosenPort}`,
+    dbPath,
+    stop,
+  };
+}
 
-  await waitForHealth(healthUrl, 15000);
+export function createManagedServer(port?: number): ManagedServer {
+  const chosenPort = port ?? 3000 + Math.floor(Math.random() * 1000);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "edge-cmd-e2e-"));
+  const dbPath = path.join(tmpDir, "commands.db");
+  let child: ChildProcess | null = null;
 
-  const stop = () =>
-    new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        cleanup();
-        resolve();
-      }, 5000);
-      child.on('exit', () => {
-        clearTimeout(timer);
-        cleanup();
-        resolve();
-      });
-      child.kill('SIGTERM');
-    });
+  async function spawnProcess(): Promise<void> {
+    child = await spawnAndWait(chosenPort, dbPath);
+  }
 
-  function cleanup() {
-    try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
+  async function terminate(signal: NodeJS.Signals): Promise<void> {
+    if (!child) return;
+    const proc = child;
+    child = null;
+    await killChild(proc, signal);
   }
 
   return {
     port: chosenPort,
-    baseUrl,
+    baseUrl: `http://localhost:${chosenPort}`,
     dbPath,
-    stop,
+    async start() {
+      await spawnProcess();
+    },
+    async stop() {
+      await terminate("SIGTERM");
+      cleanupDir(tmpDir);
+    },
+    async restart() {
+      await terminate("SIGTERM");
+      await spawnProcess();
+    },
+    async killAbruptly() {
+      await terminate("SIGKILL");
+    },
   };
+}
+
+function cleanupDir(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+}
+
+function killChild(
+  child: ChildProcess,
+  signal: NodeJS.Signals = "SIGTERM",
+): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve();
+    }, 5000);
+    child.on("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill(signal);
+  });
+}
+
+async function spawnAndWait(
+  port: number,
+  dbPath: string,
+): Promise<ChildProcess> {
+  const child: ChildProcess = spawn(process.execPath, [distEntry()], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DB_PATH: dbPath,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const baseUrl = `http://localhost:${port}`;
+  await waitForHealth(`${baseUrl}/api/v1/health`, 15000);
+  return child;
 }
 
 async function waitForHealth(url: string, timeoutMs: number): Promise<void> {
@@ -90,7 +143,9 @@ async function waitForHealth(url: string, timeoutMs: number): Promise<void> {
       await new Promise((r) => setTimeout(r, 200));
     }
   }
-  throw new Error(`Server did not become healthy at ${url} within ${timeoutMs}ms`);
+  throw new Error(
+    `Server did not become healthy at ${url} within ${timeoutMs}ms`,
+  );
 }
 
 export function sleep(ms: number): Promise<void> {

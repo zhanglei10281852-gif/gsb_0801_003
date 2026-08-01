@@ -9,11 +9,8 @@ import {
   RenewInput,
   ReportDeliveryInput,
   SubmitCommandInput,
-} from './types.js';
-import {
-  InvalidLeaseError,
-  InvalidStateTransitionError,
-} from './errors.js';
+} from "./types.js";
+import { InvalidLeaseError, InvalidStateTransitionError } from "./errors.js";
 
 export interface Decision {
   command: Command;
@@ -39,7 +36,7 @@ function createEvent(
     attempt?: number | null;
     gatewayId?: string | null;
     payload?: Record<string, unknown> | null;
-  } = {}
+  } = {},
 ): CommandEvent {
   return {
     eventId: idGen.newId(),
@@ -58,7 +55,7 @@ export function createPendingCommand(
   input: SubmitCommandInput,
   existing: Command | null,
   idGen: IdGenerator,
-  clock: Clock
+  clock: Clock,
 ): Decision {
   if (existing) {
     return { command: existing, events: [] };
@@ -70,7 +67,7 @@ export function createPendingCommand(
     commandId,
     idempotencyKey: input.idempotencyKey,
     payload: input.payload,
-    status: 'PENDING',
+    status: "PENDING",
     currentLeaseId: null,
     attempt: 0,
     maxAttempts: input.maxAttempts ?? 3,
@@ -83,14 +80,21 @@ export function createPendingCommand(
     updatedAt: now,
   };
 
-  const event = createEvent(idGen, clock, commandId, 'CommandSubmitted', 'submit', {
-    payload: {
-      idempotencyKey: input.idempotencyKey,
-      deviceId: input.payload.deviceId,
-      action: input.payload.action,
-      maxAttempts: command.maxAttempts,
+  const event = createEvent(
+    idGen,
+    clock,
+    commandId,
+    "CommandSubmitted",
+    "submit",
+    {
+      payload: {
+        idempotencyKey: input.idempotencyKey,
+        deviceId: input.payload.deviceId,
+        action: input.payload.action,
+        maxAttempts: command.maxAttempts,
+      },
     },
-  });
+  );
 
   return { command, events: [event] };
 }
@@ -99,13 +103,13 @@ export function claimCommand(
   command: Command,
   input: ClaimInput,
   idGen: IdGenerator,
-  clock: Clock
+  clock: Clock,
 ): Decision {
-  if (command.status === 'SUCCEEDED' || command.status === 'FAILED') {
+  if (command.status === "SUCCEEDED" || command.status === "FAILED") {
     throw new InvalidStateTransitionError(
       command.commandId,
       command.status,
-      'claim'
+      "claim",
     );
   }
 
@@ -118,7 +122,7 @@ export function claimCommand(
   let causedBy: string;
   let eventPayload: Record<string, unknown>;
 
-  if (command.status === 'CLAIMED') {
+  if (command.status === "CLAIMED") {
     const stillValid =
       command.leaseExpiresAt !== null && command.leaseExpiresAt > now;
     if (stillValid) {
@@ -126,23 +130,24 @@ export function claimCommand(
         command.commandId,
         command.currentLeaseId,
         leaseId,
-        'lease is still active; cannot claim while held'
+        "lease is still active; cannot claim while held",
       );
     }
-    eventType = 'CommandReclaimed';
-    causedBy = 'claim-after-expiry';
+    eventType = "CommandReclaimed";
+    causedBy = "claim-after-expiry";
     eventPayload = {
       oldLeaseId: command.currentLeaseId,
       oldGatewayId: command.gatewayId,
+      oldGeneration: command.attempt,
       newLeaseId: leaseId,
-      attempt,
+      newGeneration: attempt,
     };
   } else {
-    eventType = 'CommandClaimed';
-    causedBy = 'claim';
+    eventType = "CommandClaimed";
+    causedBy = "claim";
     eventPayload = {
       leaseId,
-      attempt,
+      generation: attempt,
       leaseDurationMs: input.leaseDurationMs,
     };
   }
@@ -150,7 +155,7 @@ export function claimCommand(
   if (attempt > command.maxAttempts) {
     const failedCommand: Command = {
       ...command,
-      status: 'FAILED',
+      status: "FAILED",
       currentLeaseId: null,
       leaseExpiresAt: null,
       gatewayId: null,
@@ -161,20 +166,20 @@ export function claimCommand(
       idGen,
       clock,
       command.commandId,
-      'CommandFailed',
-      'claim-exceeds-max-attempts',
+      "CommandFailed",
+      "claim-exceeds-max-attempts",
       {
         attempt,
         gatewayId: input.gatewayId,
         payload: { reason: failedCommand.failureReason },
-      }
+      },
     );
     return { command: failedCommand, events: [failedEvent] };
   }
 
   const updated: Command = {
     ...command,
-    status: 'CLAIMED',
+    status: "CLAIMED",
     currentLeaseId: leaseId,
     attempt,
     leaseExpiresAt,
@@ -183,12 +188,19 @@ export function claimCommand(
     updatedAt: now,
   };
 
-  const event = createEvent(idGen, clock, command.commandId, eventType, causedBy, {
-    leaseId,
-    attempt,
-    gatewayId: input.gatewayId,
-    payload: eventPayload,
-  });
+  const event = createEvent(
+    idGen,
+    clock,
+    command.commandId,
+    eventType,
+    causedBy,
+    {
+      leaseId,
+      attempt,
+      gatewayId: input.gatewayId,
+      payload: eventPayload,
+    },
+  );
 
   return { command: updated, events: [event] };
 }
@@ -197,13 +209,13 @@ export function renewLease(
   command: Command,
   input: RenewInput,
   idGen: IdGenerator,
-  clock: Clock
+  clock: Clock,
 ): Decision {
-  if (command.status !== 'CLAIMED') {
+  if (command.status !== "CLAIMED") {
     throw new InvalidStateTransitionError(
       command.commandId,
       command.status,
-      'renew'
+      "renew",
     );
   }
 
@@ -212,7 +224,7 @@ export function renewLease(
       command.commandId,
       command.currentLeaseId,
       input.leaseId,
-      'leaseId does not match current lease'
+      "leaseId does not match current lease",
     );
   }
 
@@ -222,7 +234,7 @@ export function renewLease(
       command.commandId,
       command.currentLeaseId,
       input.leaseId,
-      'lease already expired'
+      "lease already expired",
     );
   }
 
@@ -233,12 +245,19 @@ export function renewLease(
     updatedAt: now,
   };
 
-  const event = createEvent(idGen, clock, command.commandId, 'LeaseRenewed', 'renew', {
-    leaseId: input.leaseId,
-    attempt: command.attempt,
-    gatewayId: input.gatewayId,
-    payload: { leaseDurationMs: input.leaseDurationMs, leaseExpiresAt },
-  });
+  const event = createEvent(
+    idGen,
+    clock,
+    command.commandId,
+    "LeaseRenewed",
+    "renew",
+    {
+      leaseId: input.leaseId,
+      attempt: command.attempt,
+      gatewayId: input.gatewayId,
+      payload: { leaseDurationMs: input.leaseDurationMs, leaseExpiresAt },
+    },
+  );
 
   return { command: updated, events: [event] };
 }
@@ -247,13 +266,13 @@ export function reportDelivery(
   command: Command,
   input: ReportDeliveryInput,
   idGen: IdGenerator,
-  clock: Clock
+  clock: Clock,
 ): Decision {
-  if (command.status !== 'CLAIMED') {
+  if (command.status !== "CLAIMED") {
     throw new InvalidStateTransitionError(
       command.commandId,
       command.status,
-      'reportDelivery'
+      "reportDelivery",
     );
   }
 
@@ -262,7 +281,7 @@ export function reportDelivery(
       command.commandId,
       command.currentLeaseId,
       input.leaseId,
-      'leaseId does not match current lease'
+      "leaseId does not match current lease",
     );
   }
 
@@ -273,14 +292,16 @@ export function reportDelivery(
     idGen,
     clock,
     command.commandId,
-    'DeliveryReported',
-    'report-delivery',
+    "DeliveryReported",
+    "report-delivery",
     {
       leaseId: input.leaseId,
       attempt: command.attempt,
       gatewayId: input.gatewayId,
-      payload: input.deviceMessage ? { deviceMessage: input.deviceMessage } : null,
-    }
+      payload: input.deviceMessage
+        ? { deviceMessage: input.deviceMessage }
+        : null,
+    },
   );
 
   return { command: updated, events: [event] };
@@ -290,52 +311,53 @@ export function confirmCommand(
   command: Command,
   input: ConfirmInput,
   idGen: IdGenerator,
-  clock: Clock
+  clock: Clock,
 ): Decision {
   const now = clock.now();
 
-  if (command.status === 'SUCCEEDED') {
+  if (command.status === "SUCCEEDED") {
     const staleEvent = createEvent(
       idGen,
       clock,
       command.commandId,
-      'StaleMessageRejected',
-      'duplicate-confirm-after-success',
+      "StaleMessageRejected",
+      "duplicate-confirm-after-success",
       {
         leaseId: input.leaseId,
         attempt: command.attempt,
         gatewayId: input.gatewayId,
         payload: {
-          reason: 'command already succeeded',
+          reason: "command already succeeded",
           confirmationCode: input.confirmationCode,
         },
-      }
+      },
     );
     return { command, events: [staleEvent] };
   }
 
-  if (command.status === 'FAILED') {
+  if (command.status === "FAILED") {
     throw new InvalidStateTransitionError(
       command.commandId,
       command.status,
-      'confirm'
+      "confirm",
     );
   }
 
-  if (command.status === 'PENDING') {
+  if (command.status === "PENDING") {
     const staleEvent = createEvent(
       idGen,
       clock,
       command.commandId,
-      'StaleMessageRejected',
-      'confirm-after-lease-expired',
+      "StaleMessageRejected",
+      "confirm-after-lease-expired",
       {
         leaseId: input.leaseId,
         gatewayId: input.gatewayId,
         payload: {
-          reason: 'command is PENDING (previous lease expired); late confirmation rejected',
+          reason:
+            "command is PENDING (previous lease expired); late confirmation rejected",
         },
-      }
+      },
     );
     return { command, events: [staleEvent] };
   }
@@ -345,17 +367,17 @@ export function confirmCommand(
       idGen,
       clock,
       command.commandId,
-      'StaleMessageRejected',
-      'confirm-stale-lease',
+      "StaleMessageRejected",
+      "confirm-stale-lease",
       {
         leaseId: input.leaseId,
         attempt: command.attempt,
         gatewayId: input.gatewayId,
         payload: {
-          reason: 'leaseId does not match current lease (possibly reclaimed)',
+          reason: "leaseId does not match current lease (possibly reclaimed)",
           currentLeaseId: command.currentLeaseId,
         },
-      }
+      },
     );
     return { command, events: [staleEvent] };
   }
@@ -365,24 +387,25 @@ export function confirmCommand(
       idGen,
       clock,
       command.commandId,
-      'StaleMessageRejected',
-      'confirm-lease-expired',
+      "StaleMessageRejected",
+      "confirm-lease-expired",
       {
         leaseId: input.leaseId,
         attempt: command.attempt,
         gatewayId: input.gatewayId,
         payload: {
-          reason: 'lease already expired; late confirmation rejected to prevent zombie resurrection',
+          reason:
+            "lease already expired; late confirmation rejected to prevent zombie resurrection",
           leaseExpiresAt: command.leaseExpiresAt,
         },
-      }
+      },
     );
     return { command, events: [staleEvent] };
   }
 
   const succeeded: Command = {
     ...command,
-    status: 'SUCCEEDED',
+    status: "SUCCEEDED",
     confirmationCode: input.confirmationCode,
     deviceTimestamp: input.deviceTimestamp,
     leaseExpiresAt: null,
@@ -393,8 +416,8 @@ export function confirmCommand(
     idGen,
     clock,
     command.commandId,
-    'DeviceConfirmed',
-    'device-confirmation',
+    "DeviceConfirmed",
+    "device-confirmation",
     {
       leaseId: input.leaseId,
       attempt: command.attempt,
@@ -403,21 +426,21 @@ export function confirmCommand(
         confirmationCode: input.confirmationCode,
         deviceTimestamp: input.deviceTimestamp,
       },
-    }
+    },
   );
 
   const succeededEvent = createEvent(
     idGen,
     clock,
     command.commandId,
-    'CommandSucceeded',
-    'confirm',
+    "CommandSucceeded",
+    "confirm",
     {
       leaseId: input.leaseId,
       attempt: command.attempt,
       gatewayId: input.gatewayId,
       payload: { confirmationCode: input.confirmationCode },
-    }
+    },
   );
 
   return { command: succeeded, events: [confirmedEvent, succeededEvent] };
@@ -426,9 +449,9 @@ export function confirmCommand(
 export function expireLease(
   command: Command,
   idGen: IdGenerator,
-  clock: Clock
+  clock: Clock,
 ): { decision: Decision; result: ExpireResult } | null {
-  if (command.status !== 'CLAIMED') {
+  if (command.status !== "CLAIMED") {
     return null;
   }
 
@@ -445,10 +468,10 @@ export function expireLease(
   let failureReason: string | null = null;
 
   if (attemptsExhausted) {
-    updatedStatus = 'FAILED';
+    updatedStatus = "FAILED";
     failureReason = `lease expired after ${command.attempt} attempt(s); max attempts exhausted`;
   } else {
-    updatedStatus = 'PENDING';
+    updatedStatus = "PENDING";
   }
 
   const updated: Command = {
@@ -465,8 +488,8 @@ export function expireLease(
     idGen,
     clock,
     command.commandId,
-    'LeaseExpired',
-    'lease-timeout',
+    "LeaseExpired",
+    "lease-timeout",
     {
       leaseId: oldLeaseId,
       attempt: command.attempt,
@@ -476,7 +499,7 @@ export function expireLease(
         expiredAt: now,
         attemptsExhausted,
       },
-    }
+    },
   );
 
   const events: CommandEvent[] = [expiredEvent];
@@ -486,14 +509,14 @@ export function expireLease(
       idGen,
       clock,
       command.commandId,
-      'CommandFailed',
-      'lease-timeout-exhausted',
+      "CommandFailed",
+      "lease-timeout-exhausted",
       {
         leaseId: oldLeaseId,
         attempt: command.attempt,
         gatewayId: oldGatewayId,
         payload: { reason: failureReason },
-      }
+      },
     );
     events.push(failedEvent);
   }
@@ -509,10 +532,51 @@ export function expireLease(
   return { decision: { command: updated, events }, result };
 }
 
-export function isConfirmStale(command: Command, leaseId: string, now: number): boolean {
-  if (command.status === 'SUCCEEDED') return true;
-  if (command.status !== 'CLAIMED') return true;
+export function isConfirmStale(
+  command: Command,
+  leaseId: string,
+  now: number,
+): boolean {
+  if (command.status === "SUCCEEDED") return true;
+  if (command.status !== "CLAIMED") return true;
   if (command.currentLeaseId !== leaseId) return true;
-  if (command.leaseExpiresAt !== null && command.leaseExpiresAt <= now) return true;
+  if (command.leaseExpiresAt !== null && command.leaseExpiresAt <= now)
+    return true;
   return false;
+}
+
+export interface RejectedOperationInput {
+  operation: "renew" | "report-delivery" | "claim-contention";
+  leaseId: string;
+  gatewayId: string;
+  reason: string;
+}
+
+export function recordRejectedLeaseOperation(
+  command: Command,
+  input: RejectedOperationInput,
+  idGen: IdGenerator,
+  clock: Clock,
+): CommandEvent {
+  return createEvent(
+    idGen,
+    clock,
+    command.commandId,
+    "LeaseOperationRejected",
+    `rejected-${input.operation}`,
+    {
+      leaseId: input.leaseId,
+      attempt: command.attempt,
+      gatewayId: input.gatewayId,
+      payload: {
+        operation: input.operation,
+        reason: input.reason,
+        currentLeaseId: command.currentLeaseId,
+        currentGatewayId: command.gatewayId,
+        currentGeneration: command.attempt,
+        rejectedLeaseId: input.leaseId,
+        rejectedGatewayId: input.gatewayId,
+      },
+    },
+  );
 }
