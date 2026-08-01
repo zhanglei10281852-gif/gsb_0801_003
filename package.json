@@ -1,0 +1,25 @@
+{
+  "name": "edge-command-dispatch",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reliable command dispatch for intermittently-connected edge gateways (Node.js + TypeScript + SQLite)",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/server.js",
+    "test": "node --import tsx --test test/machine.test.ts test/recovery.test.ts",
+    "simulate": "tsx simulator/cli.ts",
+    "e2e": "npm run build && node dist/e2e/acceptance.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.17.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "steps": [
+    { "op": "log", "message": "示例:断网重派 + 迟到/重复确认(默认服务参数 LEASE_TTL_MS=15000)" },
+    { "op": "submit", "as": "s1", "key": "demo-001", "action": "calibrate", "params": { "axis": "y" } },
+    { "op": "submit", "as": "s2", "key": "demo-001", "action": "calibrate", "params": { "axis": "y" }, "expectDeduped": true, "expectSameCommandAs": "s1" },
+    { "op": "claim", "gateway": "gw-a", "as": "d1", "expectCommandKey": "s1", "expectAttemptNo": 1 },
+    { "op": "log", "message": "gw-a 断网:不续约也不确认,等待租约过期(15s)" },
+    { "op": "sleep", "ms": 16000 },
+    { "op": "claim", "gateway": "gw-b", "as": "d2", "expectAttemptNo": 2, "expectExecutionTokenOf": "d1" },
+    { "op": "renew", "delivery": "d2", "expect": "ok" },
+    { "op": "ack", "delivery": "d1", "ackId": "dev-late-1", "expect": "ignored" },
+    { "op": "ack", "delivery": "d2", "ackId": "dev-ok-1", "expect": "applied" },
+    { "op": "ack", "delivery": "d2", "ackId": "dev-ok-1", "expect": "duplicate" },
+    { "op": "assertStatus", "key": "demo-001", "status": "SUCCEEDED" },
+    {
+      "op": "assertEvents",
+      "key": "demo-001",
+      "includes": ["COMMAND_ACCEPTED", "DELIVERY_STARTED", "LEASE_EXPIRED", "RETRY_SCHEDULED", "DELIVERY_STARTED", "LEASE_RENEWED", "DEVICE_ACK_IGNORED", "DEVICE_ACK_APPLIED", "COMMAND_SUCCEEDED", "DEVICE_ACK_DUPLICATE"],
+      "countOf": { "COMMAND_ACCEPTED": 1, "COMMAND_SUCCEEDED": 1 }
+    }
+  ]
+}
