@@ -8,10 +8,12 @@ import {
   Ctx,
   abortDecision,
   decideAck,
+  decideCancel,
   decideClaim,
   decideHeartbeat,
   decideRenew,
   decideSubmit,
+  decideSupersede,
   expiryDecision,
   fenceStatus,
 } from '../src/domain/machine';
@@ -258,4 +260,110 @@ test('接管中止:在途投递作废并立即(不退避)回到队列,执行身�
 
   // 中止幂等:已非 ACTIVE 的尝试不再重复中止
   assert.equal(abortDecision(ab.command, ab.attempt, makeCtx(400), 'ownership_takeover'), null);
+});
+
+// ------------------------------------------------------------ 撤回与取代
+
+test('撤回:PENDING 可撤回;DISPATCHED 撤回时在途投递一并中止', () => {
+  const { command: pending } = submittedCommand();
+  const d1 = decideCancel(pending, null, { reason: 'r' }, makeCtx(10));
+  assert.deepEqual(d1.reply, { cancelled: true, deduped: false });
+  assert.equal(d1.writes.command!.status, 'CANCELLED');
+  assert.deepEqual(types(d1.writes.events), ['COMMAND_CANCELLED']);
+
+  const { command } = submittedCommand();
+  const c1 = claimed(command, 0);
+  const d2 = decideCancel(c1.command, c1.attempt, {}, makeCtx(100));
+  assert.equal(d2.writes.command!.status, 'CANCELLED');
+  assert.equal(d2.writes.command!.activeAttemptId, null);
+  assert.equal(d2.writes.attempt!.status, 'EXPIRED', '在途投递被中止');
+  assert.deepEqual(types(d2.writes.events), ['ATTEMPT_ABORTED', 'COMMAND_CANCELLED']);
+});
+
+test('撤回:已成功的指令不能伪装成撤回成功;终态拒绝;重复撤回去重', () => {
+  const { command } = submittedCommand();
+  const c1 = claimed(command, 0);
+  const done = decideAck(c1.command, c1.attempt, { ackId: 'a1', result: null, generation: 1 }, own(), null, makeCtx(500));
+  const succeeded = done.writes.command!;
+
+  const reject = decideCancel(succeeded, null, {}, makeCtx(600));
+  assert.deepEqual(reject.reply, { cancelled: false, reason: 'already_succeeded' });
+  assert.equal(reject.writes.command, undefined, '成功状态不被撤回改写');
+  assert.deepEqual(types(reject.writes.events), ['CANCEL_REJECTED']);
+
+  const cancelled = decideCancel(pending0(), null, {}, makeCtx(0)).writes.command!;
+  const dup = decideCancel(cancelled, null, {}, makeCtx(10));
+  assert.deepEqual(dup.reply, { cancelled: true, deduped: true });
+  assert.equal(dup.writes.command, undefined);
+  assert.deepEqual(types(dup.writes.events), ['CANCEL_DEDUPED']);
+
+  function pending0(): Command {
+    return decideSubmit(null, { idempotencyKey: 'kx', action: 'a', params: null }, makeCtx(0)).writes.command!;
+  }
+});
+
+test('撤回后:迟到确认只能得到 command_cancelled,指令不能复活', () => {
+  const { command } = submittedCommand();
+  const c1 = claimed(command, 0);
+  const cancelled = decideCancel(c1.command, c1.attempt, {}, makeCtx(100)).writes.command!;
+  const late = decideAck(cancelled, c1.attempt, { ackId: 'after-cancel', result: null, generation: 1 }, own(), null, makeCtx(200));
+  assert.equal(late.reply.outcome, 'ignored');
+  assert.equal(late.reply.reason, 'command_cancelled');
+  assert.equal(late.writes.command, undefined);
+});
+
+test('取代:原子退役旧指令并生成新指令,双向链可查,在途投递中止', () => {
+  const { command: old } = submittedCommand();
+  const c1 = claimed(old, 0);
+  const d = decideSupersede(
+    c1.command,
+    c1.attempt,
+    null,
+    { idempotencyKey: 'new-1', action: 'calibrate', params: { v: 2 }, supersedesKey: 'k1' },
+    makeCtx(100),
+  );
+  assert.equal(d.reply.accepted, true);
+  const created = d.writes.command!;
+  const retired = d.writes.retiredCommand!;
+  assert.equal(retired.status, 'SUPERSEDED');
+  assert.equal(retired.supersededByCommandId, created.id);
+  assert.equal(created.supersedesCommandId, old.id);
+  assert.equal(created.status, 'PENDING');
+  assert.equal(created.lineId, old.lineId, '产线沿用');
+  assert.equal(created.executionToken, `exec-${created.id}`, '替代指令是新业务请求,执行身份自其首轮起算');
+  assert.equal(d.writes.attempt!.status, 'EXPIRED');
+  assert.deepEqual(types(d.writes.events), ['ATTEMPT_ABORTED', 'COMMAND_SUPERSEDED', 'COMMAND_ACCEPTED']);
+
+  // 旧指令的迟到确认:当前代际也只能得到 command_superseded
+  const late = decideAck(retired, c1.attempt, { ackId: 'late-old', result: null, generation: 1 }, own(), null, makeCtx(200));
+  assert.equal(late.reply.reason, 'command_superseded');
+  assert.equal(late.writes.command, undefined);
+});
+
+test('取代:已成功的指令不能被取代;崩溃重试幂等重放', () => {
+  const { command } = submittedCommand();
+  const c1 = claimed(command, 0);
+  const succeeded = decideAck(c1.command, c1.attempt, { ackId: 'a1', result: null, generation: 1 }, own(), null, makeCtx(500)).writes.command!;
+
+  const reject = decideSupersede(succeeded, null, null, { idempotencyKey: 'new-2', action: 'a', params: null, supersedesKey: 'k1' }, makeCtx(600));
+  assert.deepEqual(reject.reply, { accepted: false, reason: 'already_succeeded' });
+  assert.equal(reject.writes.command, undefined, '不生成新指令');
+  assert.equal(reject.writes.retiredCommand, undefined);
+  assert.deepEqual(types(reject.writes.events), ['SUPERSEDE_REJECTED']);
+
+  // 崩溃重试:新指令已落库(取代已生效)→ 幂等重放,不重复退役、不重复生成
+  const { command: old2 } = submittedCommand(0);
+  const first = decideSupersede(old2, null, null, { idempotencyKey: 'new-3', action: 'a', params: null, supersedesKey: 'k1' }, makeCtx(100));
+  const createdNew = first.writes.command!;
+  const retry = decideSupersede(
+    first.writes.retiredCommand!,
+    null,
+    createdNew,
+    { idempotencyKey: 'new-3', action: 'a', params: null, supersedesKey: 'k1' },
+    makeCtx(200),
+  );
+  assert.equal(retry.reply.accepted, true);
+  assert.equal(retry.writes.command, undefined, '重试不生成第二条替代指令');
+  assert.equal(retry.writes.retiredCommand, undefined, '重试不重复退役');
+  assert.deepEqual(types(retry.writes.events), ['SUBMISSION_DEDUPED']);
 });

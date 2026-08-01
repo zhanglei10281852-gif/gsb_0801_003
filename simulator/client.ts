@@ -42,8 +42,13 @@ async function request(
 export class DispatchClient {
   constructor(private opts: ClientOptions) {}
 
-  async submit(idempotencyKey: string, action: string, params: unknown, lineId = 'default') {
-    return request(this.opts, 'POST', '/v1/commands', { idempotencyKey, action, params, lineId });
+  async submit(idempotencyKey: string, action: string, params: unknown, lineId = 'default', supersedes?: string) {
+    return request(this.opts, 'POST', '/v1/commands', { idempotencyKey, action, params, lineId, ...(supersedes ? { supersedes } : {}) });
+  }
+
+  /** 紧急撤回:200 {cancelled:true, deduped} / 409 {error:{code:'cancel_rejected'}} */
+  async cancel(idOrKey: string, reason?: string) {
+    return request(this.opts, 'POST', `/v1/commands/${encodeURIComponent(idOrKey)}/cancel`, { reason });
   }
 
   async getCommand(idOrKey: string) {

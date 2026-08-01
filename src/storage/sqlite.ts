@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS commands (
   attempt_count INTEGER NOT NULL,
   active_attempt_id TEXT,
   next_attempt_not_before INTEGER NOT NULL,
+  supersedes_command_id TEXT,
+  superseded_by_command_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -81,6 +83,8 @@ function rowToCommand(r: any): Command {
     attemptCount: r.attempt_count,
     activeAttemptId: r.active_attempt_id,
     nextAttemptNotBefore: r.next_attempt_not_before,
+    supersedesCommandId: r.supersedes_command_id ?? null,
+    supersededByCommandId: r.superseded_by_command_id ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -157,6 +161,10 @@ export class SqliteRepository {
     }
     if (!cols('attempts').includes('generation')) {
       this.db.exec(`ALTER TABLE attempts ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!cols('commands').includes('supersedes_command_id')) {
+      this.db.exec(`ALTER TABLE commands ADD COLUMN supersedes_command_id TEXT`);
+      this.db.exec(`ALTER TABLE commands ADD COLUMN superseded_by_command_id TEXT`);
     }
     if (!cols('events').includes('line_id')) {
       this.db.exec(`
@@ -273,13 +281,16 @@ export class SqliteRepository {
     this.db
       .prepare(
         `INSERT INTO commands (id, idempotency_key, line_id, action, params, status, execution_token,
-                               attempt_count, active_attempt_id, next_attempt_not_before, created_at, updated_at)
+                               attempt_count, active_attempt_id, next_attempt_not_before,
+                               supersedes_command_id, superseded_by_command_id, created_at, updated_at)
          VALUES (@id, @idempotencyKey, @lineId, @action, @params, @status, @executionToken,
-                 @attemptCount, @activeAttemptId, @nextAttemptNotBefore, @createdAt, @updatedAt)
+                 @attemptCount, @activeAttemptId, @nextAttemptNotBefore,
+                 @supersedesCommandId, @supersededByCommandId, @createdAt, @updatedAt)
          ON CONFLICT(id) DO UPDATE SET
            status = @status, attempt_count = @attemptCount,
            active_attempt_id = @activeAttemptId,
-           next_attempt_not_before = @nextAttemptNotBefore, updated_at = @updatedAt`,
+           next_attempt_not_before = @nextAttemptNotBefore,
+           superseded_by_command_id = @supersededByCommandId, updated_at = @updatedAt`,
       )
       .run({
         id: c.id,
@@ -292,6 +303,8 @@ export class SqliteRepository {
         attemptCount: c.attemptCount,
         activeAttemptId: c.activeAttemptId,
         nextAttemptNotBefore: c.nextAttemptNotBefore,
+        supersedesCommandId: c.supersedesCommandId,
+        supersededByCommandId: c.supersededByCommandId,
         createdAt: c.createdAt,
         updatedAt: c.updatedAt,
       });

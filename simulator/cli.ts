@@ -111,6 +111,49 @@ export function buildDefaultScenario(opts: DefaultScenarioOpts): Step[] {
     { op: 'log', message: '⑨ 终态后的迟到确认:持久化但忽略,指令绝不能复活' },
     { op: 'ack', delivery: `dx${maxAttempts}`, ackId: 'dev-ack-too-late', expect: 'ignored' },
     { op: 'assertStatus', key: 'switch-0007', status: 'FAILED' },
+
+    { op: 'log', message: '⑩ 紧急撤回:未完成的动作可撤回;已成功的动作绝不能伪装成撤回成功' },
+    { op: 'heartbeat', gateway: 'gw-4', line: 'line-3', expect: 'acquired', expectGeneration: 1 },
+    { op: 'submit', as: 'sc1', key: 'cancel-1', action: 'switch_recipe', params: { recipe: 'C' }, line: 'line-3' },
+    { op: 'cancel', key: 'cancel-1', reason: '工艺临时变更', expect: 'cancelled' },
+    { op: 'cancel', key: 'cancel-1', expect: 'deduped' },
+    { op: 'claim', gateway: 'gw-4', line: 'line-3', expect: 'empty' },
+    { op: 'cancel', key: 'cal-2026-0001', expect: 'rejected' },
+    { op: 'assertStatus', key: 'cancel-1', status: 'CANCELLED' },
+    { op: 'assertStatus', key: 'cal-2026-0001', status: 'SUCCEEDED' },
+    {
+      op: 'assertEvents',
+      key: 'cancel-1',
+      includes: ['COMMAND_ACCEPTED', 'COMMAND_CANCELLED', 'CANCEL_DEDUPED'],
+      countOf: { COMMAND_CANCELLED: 1 },
+    },
+
+    { op: 'log', message: '⑪ 替代指令:旧指令原子退役,在途迟到确认留痕但不生效;已成功的不能被取代' },
+    { op: 'submit', as: 'sOld', key: 'old-300', action: 'calibrate', params: { axis: 'z', target: 10 }, line: 'line-3' },
+    { op: 'claim', gateway: 'gw-4', line: 'line-3', as: 'dOld', expectCommandKey: 'sOld', expectAttemptNo: 1 },
+    { op: 'submit', as: 'sNew', key: 'new-300', action: 'calibrate', params: { axis: 'z', target: 20 }, line: 'line-3', supersedes: 'old-300', expect: 'accepted' },
+    { op: 'assertStatus', key: 'old-300', status: 'SUPERSEDED' },
+    { op: 'ack', delivery: 'dOld', ackId: 'dev-old-300', expect: 'ignored' },
+    { op: 'claim', gateway: 'gw-4', line: 'line-3', as: 'dNew', expectCommandKey: 'sNew', expectAttemptNo: 1 },
+    { op: 'ack', delivery: 'dNew', ackId: 'dev-new-300', expect: 'applied' },
+    { op: 'submit', key: 'newer-300', action: 'calibrate', params: { axis: 'z', target: 30 }, line: 'line-3', supersedes: 'new-300', expect: 'rejected' },
+    { op: 'assertStatus', key: 'new-300', status: 'SUCCEEDED' },
+    {
+      op: 'assertEvents',
+      key: 'old-300',
+      includes: ['COMMAND_ACCEPTED', 'DELIVERY_STARTED', 'ATTEMPT_ABORTED', 'COMMAND_SUPERSEDED', 'DEVICE_ACK_IGNORED'],
+      countOf: { COMMAND_SUPERSEDED: 1, DEVICE_ACK_IGNORED: 1 },
+    },
+    {
+      op: 'assertLineEvents',
+      line: 'line-3',
+      includes: ['COMMAND_SUPERSEDED', 'DEVICE_ACK_IGNORED', 'DEVICE_ACK_APPLIED', 'COMMAND_SUCCEEDED'],
+    },
+
+    { op: 'log', message: '⑫ 失联旧网关重连:沿用上一轮代际的操作依旧全部被 fencing' },
+    { op: 'claim', gateway: 'gw-1', line: 'line-1', generation: 1, expect: 'fenced' },
+    { op: 'ack', delivery: 'd1', generation: 1, ackId: 'dev-ack-reconnect', expect: 'fenced' },
+    { op: 'assertStatus', key: 'cal-2026-0001', status: 'SUCCEEDED' },
   ];
 }
 

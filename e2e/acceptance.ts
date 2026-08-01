@@ -232,18 +232,93 @@ async function partD(dbPath: string): Promise<void> {
   await server.stop();
 }
 
+async function partE(dbPath: string): Promise<void> {
+  console.log('\n[E] 紧急撤回与替代指令:原子性、拒绝伪装、崩溃恢复与因果链');
+  let server = await startServer(dbPath);
+  const client = new DispatchClient({ baseUrl: BASE_URL, timeoutMs: 3000 });
+  const LINE = 'line-e';
+
+  // ① 取代的原子性:旧指令在途 → 取代落库 → 进程立刻重启
+  await client.heartbeat('gw-e', LINE);
+  await client.submit('old-900', 'calibrate', { v: 1 }, LINE);
+  const c1 = await client.claim('gw-e', LINE, 1, 1);
+  const t1 = c1.body.tasks[0];
+  const sup = await client.submit('new-900', 'calibrate', { v: 2 }, LINE, 'old-900');
+  check('取代被接受且返回取代链', sup.status === 201 && !!sup.body.supersededCommandId);
+  await server.stop(); // 崩溃窗口:取代刚落库即宕机
+  server = await startServer(dbPath);
+  const oldCmd = await client.getCommand('old-900');
+  const newCmd = await client.getCommand('new-900');
+  check(
+    '重启后原子性可见:旧 SUPERSEDED + 新 PENDING + 双向链',
+    oldCmd.body.status === 'SUPERSEDED' &&
+      newCmd.body.status === 'PENDING' &&
+      newCmd.body.supersedesCommandId === oldCmd.body.id &&
+      oldCmd.body.supersededByCommandId === newCmd.body.id,
+  );
+  const retry = await client.submit('new-900', 'calibrate', { v: 2 }, LINE, 'old-900');
+  check('崩溃重试取代提交:幂等去重', retry.status === 200 && retry.body.deduped === true && retry.body.commandId === newCmd.body.id);
+
+  // ② 旧指令在途迟到确认:当前代际也只能留痕,不得生效/伪装
+  const late = await client.ack('gw-e', t1.leaseId, 1, 'dev-late-900', { done: true });
+  check('旧指令迟到确认 → command_superseded', late.body.outcome === 'ignored' && late.body.reason === 'command_superseded');
+  check('旧指令保持 SUPERSEDED', (await client.getCommand('old-900')).body.status === 'SUPERSEDED');
+
+  // ③ 替代指令走通成功边界后:不能再被撤回或取代
+  const c2 = await client.claim('gw-e', LINE, 1, 1);
+  check('替代指令可被领取(attempt=1)', c2.body.tasks.length === 1 && c2.body.tasks[0].attemptNo === 1);
+  await client.ack('gw-e', c2.body.tasks[0].leaseId, 1, 'dev-ok-900', { done: true });
+  const cancelSucc = await client.cancel('new-900', 'too-late');
+  check('已成功的指令不能被伪装成撤回成功', cancelSucc.status === 409 && cancelSucc.body.error.message === 'already_succeeded');
+  const supSucc = await client.submit('newer-900', 'calibrate', { v: 3 }, LINE, 'new-900');
+  check('已成功的指令不能被取代', supSucc.status === 409 && supSucc.body.error.code === 'supersede_rejected');
+  check('被拒的取代不生成新指令', (await client.getCommand('newer-900')).status === 404);
+  check('成功状态不被改写', (await client.getCommand('new-900')).body.status === 'SUCCEEDED');
+
+  // ④ 撤回:未完成可撤回;重复撤回幂等;撤回后不可领取
+  await client.submit('temp-1', 'switch_recipe', { recipe: 'X' }, LINE);
+  const cancel1 = await client.cancel('temp-1', 'e-stop');
+  check('未完成指令撤回成功', cancel1.status === 200 && cancel1.body.cancelled === true);
+  await server.stop(); // 崩溃窗口:撤回落库后立刻宕机
+  server = await startServer(dbPath);
+  const cancel2 = await client.cancel('temp-1');
+  check('重启后撤回保持,重复撤回幂等去重', cancel2.status === 200 && cancel2.body.deduped === true);
+  const afterCancel = await client.claim('gw-e', LINE, 1, 1);
+  check('已撤回指令不可被领取', afterCancel.body.tasks.length === 0);
+  check('撤回状态保持', (await client.getCommand('temp-1')).body.status === 'CANCELLED');
+
+  // ⑤ 因果链可查询:取代→拒绝→迟到回执全程留痕
+  const oldEvents = (await client.getEvents(oldCmd.body.id)).body.events.map((e: any) => e.type);
+  check(
+    '旧指令因果链(接受→投递→中止→被取代→迟到确认留痕)',
+    subsequence(oldEvents, ['COMMAND_ACCEPTED', 'DELIVERY_STARTED', 'ATTEMPT_ABORTED', 'COMMAND_SUPERSEDED', 'DEVICE_ACK_IGNORED']),
+    oldEvents.join(','),
+  );
+  const newEvents = (await client.getEvents(newCmd.body.id)).body.events.map((e: any) => e.type);
+  check(
+    '替代指令因果链(接受(含取代来源)→投递→确认→成功;取代/撤回被拒留痕)',
+    subsequence(newEvents, ['COMMAND_ACCEPTED', 'DELIVERY_STARTED', 'DEVICE_ACK_APPLIED', 'COMMAND_SUCCEEDED', 'CANCEL_REJECTED', 'SUPERSEDE_REJECTED']),
+    newEvents.join(','),
+  );
+  const tempEvents = (await client.getEvents((await client.getCommand('temp-1')).body.id)).body.events.map((e: any) => e.type);
+  check('撤回因果链(接受→撤回→去重)', subsequence(tempEvents, ['COMMAND_ACCEPTED', 'COMMAND_CANCELLED', 'CANCEL_DEDUPED']), tempEvents.join(','));
+  await server.stop();
+}
+
 async function main(): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'dispatch-e2e-'));
   // A 段独立库(其残留指令不影响 B 段领取顺序);B/C 段共享同一库以验证重启恢复
   const dbA = join(dir, 'a.db');
   const dbB = join(dir, 'b.db');
   const dbD = join(dir, 'd.db');
+  const dbE = join(dir, 'e.db');
   console.log(`[e2e] server=${SERVER_JS}`);
   try {
     await partA(dbA);
     await partB(dbB);
     await partC(dbB);
     await partD(dbD);
+    await partE(dbE);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

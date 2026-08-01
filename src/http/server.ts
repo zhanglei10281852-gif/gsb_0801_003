@@ -48,7 +48,7 @@ export function createServer(service: DispatchService, config: ServerConfig): ht
       const body = method === 'POST' ? ((await readBody(req)) as Record<string, unknown>) : {};
       const str = (v: unknown, fallback = ''): string => (v === undefined || v === null ? fallback : String(v));
 
-      // 上游:提交指令(业务幂等键 + 产线)
+      // 上游:提交指令(业务幂等键 + 产线;带 supersedes 时为替代指令)
       if (method === 'POST' && path === '/v1/commands') {
         const reply = service.submit(
           {
@@ -56,6 +56,7 @@ export function createServer(service: DispatchService, config: ServerConfig): ht
             action: str(body.action),
             params: body.params ?? null,
             lineId: str(body.lineId ?? body.line_id, 'default'),
+            ...(body.supersedes ? { supersedesKey: str(body.supersedes) } : {}),
           },
           requestId,
         );
@@ -63,7 +64,24 @@ export function createServer(service: DispatchService, config: ServerConfig): ht
         if (config.crashAfterSubmitCommit) {
           process.exit(42);
         }
+        if ('accepted' in reply) {
+          // 替代指令语义:被拒(目标已成功/已终态)时不生成新指令
+          if (!reply.accepted) {
+            return send(res, 409, { error: { code: 'supersede_rejected', message: reply.reason } });
+          }
+          return send(res, reply.deduped ? 200 : 201, reply);
+        }
         return send(res, reply.deduped ? 200 : 201, reply);
+      }
+
+      // 上游:紧急撤回(仅未完成指令可撤回;已成功的一律拒绝)
+      if (method === 'POST' && path.startsWith('/v1/commands/') && path.endsWith('/cancel')) {
+        const id = decodeURIComponent(path.slice('/v1/commands/'.length, -'/cancel'.length));
+        const reply = service.cancel(id, { requestedBy: str(body.requestedBy ?? body.requested_by) || undefined, reason: str(body.reason) || undefined }, requestId);
+        if (!reply.cancelled) {
+          return send(res, 409, { error: { code: 'cancel_rejected', message: reply.reason } });
+        }
+        return send(res, 200, reply);
       }
 
       // 上游/运维:查询指令进度

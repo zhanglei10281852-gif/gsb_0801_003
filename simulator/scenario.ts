@@ -3,7 +3,10 @@
  *
  * 支持的操作(op):
  *  - log             { message }
- *  - submit          { as, key, action, params, line, expectDeduped, expectSameCommandAs }
+ *  - submit          { as, key, action, params, line, supersedes?,
+ *                      expect(带 supersedes 时): 'accepted'|'rejected'|'deduped',
+ *                      expectDeduped, expectSameCommandAs }
+ *  - cancel          { key|command, reason?, expect: 'cancelled'|'deduped'|'rejected' }
  *  - heartbeat       { gateway, line, expect: 'acquired'|'rejected', expectGeneration }
  *  - claim           { gateway, line, as, generation?, expect: 'tasks'|'empty'|'fenced',
  *                      expectCommandKey, expectAttemptNo, expectExecutionTokenOf, expectGeneration }
@@ -131,7 +134,36 @@ export async function runScenario(
         }
 
         case 'submit': {
-          const r = await client.submit(String(step.key), String(step.action), step.params ?? null, String(step.line ?? 'default'));
+          const r = await client.submit(
+            String(step.key),
+            String(step.action),
+            step.params ?? null,
+            String(step.line ?? 'default'),
+            step.supersedes ? String(step.supersedes) : undefined,
+          );
+          // 替代指令提交的期望语义
+          if (step.supersedes) {
+            const expect = String(step.expect ?? 'accepted');
+            if (expect === 'rejected') {
+              if (r.status === 409 && r.body?.error?.code === 'supersede_rejected') {
+                ok(`supersede ${step.key} 被拒(${r.body.error.message})`);
+              } else {
+                fail(`supersede ${step.key}: 期望 rejected,实际 HTTP ${r.status} ${JSON.stringify(r.body)}`);
+              }
+              break;
+            }
+            if (r.status !== 200 && r.status !== 201) {
+              fail(`supersede ${step.key}: HTTP ${r.status} ${JSON.stringify(r.body)}`);
+              break;
+            }
+            if (expect === 'deduped' && r.body.deduped !== true) {
+              fail(`supersede ${step.key}: 期望 deduped,实际 ${JSON.stringify(r.body)}`);
+              break;
+            }
+            submissions.set(String(step.as ?? step.key), { commandId: r.body.commandId, key: String(step.key) });
+            ok(`supersede ${step.key} → ${r.body.commandId} 取代 ${r.body.supersededCommandId} (deduped=${r.body.deduped})`);
+            break;
+          }
           if (r.status !== 200 && r.status !== 201) {
             fail(`submit ${step.key}: HTTP ${r.status} ${JSON.stringify(r.body)}`);
             break;
@@ -150,6 +182,30 @@ export async function runScenario(
             }
           }
           ok(`submit ${step.key} → ${sub.commandId} (line=${r.body.lineId}, deduped=${r.body.deduped})`);
+          break;
+        }
+
+        case 'cancel': {
+          const idOrKey = String(step.command ?? step.key ?? '');
+          const r = await client.cancel(idOrKey, step.reason ? String(step.reason) : undefined);
+          const expect = String(step.expect ?? 'cancelled');
+          if (expect === 'rejected') {
+            if (r.status === 409 && r.body?.error?.code === 'cancel_rejected') {
+              ok(`cancel ${idOrKey} 被拒(${r.body.error.message})`);
+            } else {
+              fail(`cancel ${idOrKey}: 期望 rejected,实际 HTTP ${r.status} ${JSON.stringify(r.body)}`);
+            }
+            break;
+          }
+          if (r.status !== 200) {
+            fail(`cancel ${idOrKey}: HTTP ${r.status} ${JSON.stringify(r.body)}`);
+            break;
+          }
+          if (expect === 'deduped' && r.body.deduped !== true) {
+            fail(`cancel ${idOrKey}: 期望 deduped,实际 ${JSON.stringify(r.body)}`);
+            break;
+          }
+          ok(`cancel ${idOrKey} → cancelled (deduped=${r.body.deduped})`);
           break;
         }
 

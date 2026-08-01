@@ -7,6 +7,8 @@ import { randomUUID } from 'node:crypto';
 import {
   AckReply,
   AckRequest,
+  CancelReply,
+  CancelRequest,
   ClaimTask,
   Ctx,
   Decision,
@@ -16,12 +18,16 @@ import {
   RenewReply,
   SubmitReply,
   SubmitRequest,
+  SupersedeReply,
+  SupersedeRequest,
   abortDecision,
   decideAck,
+  decideCancel,
   decideClaim,
   decideHeartbeat,
   decideRenew,
   decideSubmit,
+  decideSupersede,
   expiryDecision,
   fenceStatus,
 } from '../domain/machine';
@@ -59,6 +65,7 @@ export class DispatchService {
   private apply<T>(d: Decision<T>): T {
     const w = d.writes;
     if (w.command) this.repo.upsertCommand(w.command);
+    if (w.retiredCommand) this.repo.upsertCommand(w.retiredCommand);
     if (w.attempt) this.repo.upsertAttempt(w.attempt);
     if (w.ack) this.repo.insertAck(w.ack);
     if (w.ownership) this.repo.upsertOwnership(w.ownership);
@@ -66,13 +73,32 @@ export class DispatchService {
     return d.reply;
   }
 
-  submit(req: SubmitRequest, requestId: string): SubmitReply {
+  submit(req: SubmitRequest | SupersedeRequest, requestId: string): SubmitReply | SupersedeReply {
     if (!req.idempotencyKey || !req.action) {
       throw new HttpError(400, 'bad_request', 'idempotencyKey 与 action 必填');
     }
+    const supersedesKey = (req as SupersedeRequest).supersedesKey;
     return this.repo.tx(() => {
+      if (supersedesKey) {
+        // 替代指令:旧指令退役与新指令生成在同一事务中原子完成
+        const old = this.repo.findCommandByKey(supersedesKey) ?? this.repo.findCommandById(supersedesKey);
+        if (!old) throw new HttpError(404, 'supersede_target_not_found', `被取代指令 ${supersedesKey} 不存在`);
+        const existingNew = this.repo.findCommandByKey(req.idempotencyKey);
+        const oldAttempt = old.activeAttemptId ? this.repo.findAttemptById(old.activeAttemptId) : null;
+        return this.apply(decideSupersede(old, oldAttempt, existingNew, req as SupersedeRequest, this.ctx(requestId)));
+      }
       const existing = this.repo.findCommandByKey(req.idempotencyKey);
       return this.apply(decideSubmit(existing, req, this.ctx(requestId)));
+    });
+  }
+
+  /** 紧急撤回:仅对未完成指令生效;已成功的指令拒绝(不能伪装成撤回成功) */
+  cancel(idOrKey: string, req: CancelRequest, requestId: string): CancelReply {
+    return this.repo.tx(() => {
+      const command = this.repo.findCommandById(idOrKey) ?? this.repo.findCommandByKey(idOrKey);
+      if (!command) throw new HttpError(404, 'not_found', `指令 ${idOrKey} 不存在`);
+      const attempt = command.activeAttemptId ? this.repo.findAttemptById(command.activeAttemptId) : null;
+      return this.apply(decideCancel(command, attempt, req, this.ctx(requestId)));
     });
   }
 

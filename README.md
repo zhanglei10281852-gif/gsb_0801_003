@@ -8,6 +8,10 @@
 备用网关在所有权租约到期时接管(代际 +1)。网络分区恢复后,旧代际网关的一切操作
 (领取/续约/确认)都会被 fencing 拒绝且不得推进状态——但全部留痕可审计。
 
+**撤回与取代**:上游可紧急撤回尚未完成的指令,或提交一条明确取代旧指令的安全替代指令
+(原子完成"旧指令退役 + 新指令生成")。已经被设备确认执行的指令,既不能被伪装成撤回成功,
+也不能被取代——拒绝并留痕。
+
 - 运行时:Node.js ≥ 20 + TypeScript + SQLite(better-sqlite3,WAL)
 - 不依赖 Docker / Redis / 任何远程托管服务
 - 领域状态机是纯函数,与 HTTP、网关传输、存储适配器完全解耦,故障时序可确定性测试
@@ -66,7 +70,8 @@ test/          状态机确定性测试 + 基于真实 SQLite 文件的崩溃恢
 | Ack | 设备确认。`ackId` 唯一用于去重;`applied=false` 的确认(迟到/乱序/被 fencing)也会持久化并记录原因 |
 | Event | 因果事件日志(`seq` 全局单调)。分指令维度与产线维度(所有权/争抢/fencing),可还原接管前后的完整因果 |
 
-状态机:`PENDING → DISPATCHED →(确认生效)SUCCEEDED`;`DISPATCHED →(租约过期/接管中止)PENDING(重试)`;重试耗尽 `→ FAILED`。`SUCCEEDED`/`FAILED` 为终态,不可逆。
+状态机:`PENDING → DISPATCHED →(确认生效)SUCCEEDED`;`DISPATCHED →(租约过期/接管中止)PENDING(重试)`;重试耗尽 `→ FAILED`;
+未完成时 `→ CANCELLED(撤回)` 或 `→ SUPERSEDED(被取代)`。`SUCCEEDED`/`FAILED`/`CANCELLED`/`SUPERSEDED` 均为终态,不可逆。
 
 ### 所有权与 fencing 规则
 
@@ -82,6 +87,22 @@ test/          状态机确定性测试 + 基于真实 SQLite 文件的崩溃恢
    审计能看到"设备其实确认了,但经由旧代际送达",状态推进只认当前代际。
 5. 所有权与代际持久化在 SQLite,**跨进程重启保持**:重启后旧代际依旧被 fencing。
 
+### 撤回与取代规则
+
+1. **撤回** `POST /v1/commands/:id/cancel`:仅 `PENDING`/`DISPATCHED` 可撤回;
+   撤回 `DISPATCHED` 指令时在途投递一并中止(`ATTEMPT_ABORTED`),网关随后的确认/续约只能得到
+   `command_cancelled`/`attempt_not_active`。重复撤回幂等去重(`CANCEL_DEDUPED`,
+   覆盖"撤回落库后、响应前崩溃"的重试)。`SUCCEEDED` → 409 `already_succeeded`
+   (不能伪装成撤回成功);其他终态 → 409 `already_terminal`。
+2. **取代** `POST /v1/commands` 携带 `supersedes`:在同一事务中原子完成
+   "旧指令 → `SUPERSEDED`(在途投递中止)+ 新指令生成(`PENDING`)";
+   崩溃重试同幂等键只幂等重放,绝不重复退役或重复生成。目标已成功 → 409 且**不生成新指令**;
+   目标已终态 → 409。替代指令是新的业务请求,拥有自己的 `executionToken`
+   (首轮稳定执行身份自首轮起算),`lineId` 缺省沿用旧指令产线。
+3. 取代链双向可查:指令行的 `supersedesCommandId` / `supersededByCommandId`,
+   事件流的 `COMMAND_SUPERSEDED {byCommandId}` 与新指令的 `COMMAND_ACCEPTED {supersedesCommandId}` 互为因果。
+4. 旧指令的迟到确认:留痕并给出精确原因 `command_cancelled` / `command_superseded`,绝不生效。
+
 ## 交付保证(能做到的)
 
 1. **提交幂等**:同一 `idempotencyKey` 无论提交多少次(包括"服务持久化后、响应前崩溃"导致的
@@ -95,7 +116,8 @@ test/          状态机确定性测试 + 基于真实 SQLite 文件的崩溃恢
    设备侧据此去重,同一业务请求不会被设备执行两次(需要设备配合,见下节)。
 5. **至多一次成功标记**:只有"已持久化且被应用"的设备确认能把指令标为 `SUCCEEDED`;
    确认与状态迁移、因果事件在**同一个 SQLite 事务**中提交。
-6. **终态不可逆**:迟到确认、迟到续约、旧代际消息不能复活 `SUCCEEDED`/`FAILED` 指令。
+6. **终态不可逆**:迟到确认、迟到续约、旧代际消息、撤回、取代都不能复活或改写
+   `SUCCEEDED`/`FAILED`/`CANCELLED`/`SUPERSEDED` 指令。
 7. **语义不依赖巡检时序**:过期判定只取决于时钟。领取/续约/确认路径与后台巡检器使用同一判定函数
    做惰性结算,"巡检器先跑还是迟到消息先到"产生完全一致的结果,消除时序竞态。
 8. **可解释的因果追溯**:每次提交去重、所有权获取/续约/接管/争抢、投递、中止、过期、重试、
@@ -124,6 +146,7 @@ test/          状态机确定性测试 + 基于真实 SQLite 文件的崩溃恢
 |---|---|
 | 提交:落库前 | 指令不存在;客户端以同幂等键重提即可,无副作用 |
 | 提交:落库后、响应前 | 指令已存在;客户端重提同幂等键 → 返回原指令(`deduped=true`) |
+| 撤回/取代:落库后、响应前 | 撤回保持,重试去重(`CANCEL_DEDUPED`);取代原子生效(旧退役+新生成),重试只幂等重放 |
 | 心跳/接管:落库后、响应前 | 所有权与代际已生效;网关重新心跳,已持有者续约、未持有者看到当前属主与代际 |
 | 领取:落库后、响应前 | 网关从未拿到任务;投递租约到期后自动重派(执行身份不变) |
 | 续约/确认:落库前 | 视为未发生;租约到期或网关重发确认即可收敛 |
@@ -137,7 +160,8 @@ test/          状态机确定性测试 + 基于真实 SQLite 文件的崩溃恢
 
 | 方法/路径 | 说明 |
 |---|---|
-| `POST /v1/commands` | 提交指令 `{idempotencyKey, action, params, lineId?}`;201 新建 / 200 去重命中 |
+| `POST /v1/commands` | 提交指令 `{idempotencyKey, action, params, lineId?, supersedes?}`;201 新建 / 200 去重命中;带 `supersedes` 时为替代指令(409 表示被拒且不生成新指令) |
+| `POST /v1/commands/:idOrKey/cancel` | 紧急撤回 `{reason?, requestedBy?}`;200 撤回/去重,409 拒绝(已成功/已终态) |
 | `GET /v1/commands/:idOrKey` | 查询进度(指令 id 或幂等键) |
 | `GET /v1/commands/:id/events` | 追溯该指令的完整因果事件 |
 | `POST /v1/gateway/heartbeats` | 网关心跳 `{gatewayId, lineId}` → `{acquired, generation, owner, leaseExpiresAt}`;过期即接管(代际 +1) |
@@ -167,11 +191,12 @@ test/          状态机确定性测试 + 基于真实 SQLite 文件的崩溃恢
 ## 模拟器场景脚本
 
 场景是 JSON 步骤数组(`steps`),逐步执行并校验期望,任一失败即非零退出。
-`op` 一览:`log / submit / heartbeat / claim / renew / ack / sleep / waitStatus / assertStatus / assertEvents / assertLineEvents / assertOwnership`。
+`op` 一览:`log / submit(可带 supersedes)/ cancel / heartbeat / claim / renew / ack / sleep / waitStatus / assertStatus / assertEvents / assertLineEvents / assertOwnership`。
 
 - **断网/失联**:领取后不再 `heartbeat`/`renew`/`ack`(配合 `sleep` 超过租约)
 - **双网关争抢/接管**:两台网关对同一 `line` 心跳;主沉默超过 `OWNERSHIP_LEASE_TTL_MS` 后备用接管
 - **网络分区旧代际仍发送**:`claim`/`ack` 显式给旧 `generation`,`expect: 'fenced'`
+- **撤回/取代**:`cancel`(`expect: cancelled|deduped|rejected`)与带 `supersedes` 的 `submit`(`expect: accepted|rejected|deduped`)
 - **重复提交**:两个 `submit` 使用相同 `key`
 - **乱序/重复确认**:任意顺序多个 `ack`,`expect: applied|ignored|duplicate|fenced`
 - **执行身份沿用**:`claim` 的 `expectExecutionTokenOf`
@@ -182,12 +207,15 @@ test/          状态机确定性测试 + 基于真实 SQLite 文件的崩溃恢
 
 ## 测试与验收
 
-- `npm test`:22 个用例。状态机测试注入假时钟/ID,确定性复现超时、迟到、乱序、重复、
-  心跳争抢、接管、fencing 判定矩阵;恢复测试用真实 SQLite 文件,以"关库→同库重启服务"
-  模拟进程崩溃,验证所有权代际跨重启保持。
-- `npm run e2e`:编译后真实启动服务子进程,分四段验收——
+- `npm test`:30 个用例。状态机测试注入假时钟/ID,确定性复现超时、迟到、乱序、重复、
+  心跳争抢、接管、fencing 判定矩阵、撤回、取代;恢复测试用真实 SQLite 文件,以"关库→
+  同库重启服务"模拟进程崩溃,验证所有权代际、撤回与取代原子性跨重启保持。
+- `npm run e2e`:编译后真实启动服务子进程,分五段验收——
   A 崩溃注入(落库后响应前退出,exit 42)→ 重启幂等重提;
-  B spawn 编译后的模拟器跑完整故障场景(27 项断言:争抢/接管/fencing/重复与乱序确认/重试耗尽);
+  B spawn 编译后的模拟器跑完整故障场景(50 项断言:争抢/接管/fencing/重复与乱序确认/
+  重试耗尽/撤回/取代/旧网关重连);
   C 再次重启验证状态恢复、幂等保持、所有权保持、事件序号单调;
   D 双冗余网关全链路:争抢 → 主领取 → 调度进程重启(fencing 保持)→ 主沉默 → 备用接管 →
-  旧代际领取/确认被拒且状态不被推进 → 新代际重投沿用执行身份并确认成功 → 产线事件流还原因果。
+  旧代际领取/确认被拒且状态不被推进 → 新代际重投沿用执行身份并确认成功 → 产线事件流还原因果;
+  E 撤回与取代:取代原子性跨重启可见、崩溃重试幂等、旧指令迟到确认留痕不生效、
+  已成功者不能被撤回/取代、撤回后不可领取、三段因果链可查询。

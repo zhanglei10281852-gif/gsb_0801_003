@@ -43,6 +43,8 @@ export interface Ctx {
 /** 状态机产出的写集合(由存储适配器在单个事务中落库) */
 export interface Writes {
   command?: Command;
+  /** 被取代而退役的旧指令(仅 supersede 决策产生,与新指令原子落库) */
+  retiredCommand?: Command;
   attempt?: Attempt;
   ack?: AckRecord;
   ownership?: Ownership;
@@ -262,6 +264,8 @@ export function decideSubmit(
     attemptCount: 0,
     activeAttemptId: null,
     nextAttemptNotBefore: ctx.now,
+    supersedesCommandId: null,
+    supersededByCommandId: null,
     createdAt: ctx.now,
     updatedAt: ctx.now,
   };
@@ -607,6 +611,12 @@ export function decideAck(
   if (command.status === 'FAILED') {
     return ignoredAck(command, attempt, req, 'command_terminal', 'DEVICE_ACK_IGNORED', ctx, [], {});
   }
+  if (command.status === 'CANCELLED') {
+    return ignoredAck(command, attempt, req, 'command_cancelled', 'DEVICE_ACK_IGNORED', ctx, [], {});
+  }
+  if (command.status === 'SUPERSEDED') {
+    return ignoredAck(command, attempt, req, 'command_superseded', 'DEVICE_ACK_IGNORED', ctx, [], {});
+  }
   if (attempt.status !== 'ACTIVE') {
     return ignoredAck(command, attempt, req, 'attempt_not_active', 'DEVICE_ACK_IGNORED', ctx, [], {});
   }
@@ -643,5 +653,187 @@ export function decideAck(
       ],
     },
     reply: { outcome: 'applied', reason: null, duplicate: false, commandStatus: 'SUCCEEDED' },
+  };
+}
+
+// ---------------------------------------------------------------- cancel
+
+export interface CancelRequest {
+  requestedBy?: string;
+  reason?: string;
+}
+
+export type CancelReply =
+  | { cancelled: true; deduped: boolean }
+  | { cancelled: false; reason: string };
+
+/**
+ * 紧急撤回:仅对尚未完成的指令(PENDING/DISPATCHED)生效。
+ * - 已被设备确认执行(SUCCEEDED)的指令绝不能伪装成撤回成功:拒绝并留痕。
+ * - FAILED/SUPERSEDED 已是终态:拒绝。
+ * - 重复撤回(含"撤回落库后、响应前崩溃"的重试):幂等去重。
+ * - DISPATCHED 中的指令:在途投递一并中止,网关随后的确认/续约
+ *   只会得到 command_cancelled / attempt_not_active,不能复活指令。
+ */
+export function decideCancel(
+  command: Command,
+  activeAttempt: Attempt | null,
+  req: CancelRequest,
+  ctx: Ctx,
+): Decision<CancelReply> {
+  if (command.status === 'CANCELLED') {
+    return {
+      writes: { events: [cmdEv(ctx, command, null, 'CANCEL_DEDUPED', {})] },
+      reply: { cancelled: true, deduped: true },
+    };
+  }
+  if (command.status === 'SUCCEEDED') {
+    return {
+      writes: { events: [cmdEv(ctx, command, null, 'CANCEL_REJECTED', { reason: 'already_succeeded', requestedBy: req.requestedBy ?? null })] },
+      reply: { cancelled: false, reason: 'already_succeeded' },
+    };
+  }
+  if (command.status !== 'PENDING' && command.status !== 'DISPATCHED') {
+    return {
+      writes: { events: [cmdEv(ctx, command, null, 'CANCEL_REJECTED', { reason: 'already_terminal', status: command.status })] },
+      reply: { cancelled: false, reason: 'already_terminal' },
+    };
+  }
+
+  const events: DomainEvent[] = [];
+  let attempt: Attempt | undefined;
+  if (command.status === 'DISPATCHED' && activeAttempt && activeAttempt.status === 'ACTIVE') {
+    attempt = { ...activeAttempt, status: 'EXPIRED' };
+    events.push(
+      cmdEv(ctx, command, attempt.id, 'ATTEMPT_ABORTED', {
+        reason: 'command_cancelled',
+        attemptNo: attempt.attemptNo,
+        gatewayId: attempt.gatewayId,
+        generation: attempt.generation,
+      }),
+    );
+  }
+  const next: Command = { ...command, status: 'CANCELLED', activeAttemptId: null, updatedAt: ctx.now };
+  events.push(
+    cmdEv(ctx, command, attempt?.id ?? null, 'COMMAND_CANCELLED', {
+      requestedBy: req.requestedBy ?? null,
+      reason: req.reason ?? null,
+    }),
+  );
+  return { writes: { command: next, attempt, events }, reply: { cancelled: true, deduped: false } };
+}
+
+// ---------------------------------------------------------------- supersede
+
+export interface SupersedeRequest extends SubmitRequest {
+  /** 被取代指令的幂等键或指令 id */
+  supersedesKey: string;
+}
+
+export type SupersedeReply =
+  | { accepted: true; deduped: boolean; commandId: string; supersededCommandId: string; executionToken: string; lineId: string }
+  | { accepted: false; reason: string };
+
+/**
+ * 替代指令:原子完成"旧指令退役(SUPERSEDED)+ 新指令生成(PENDING)"。
+ * - 旧指令已成功:拒绝整个提交(不生成新指令),不能把已执行的动作伪装成被取代;
+ * - 旧指令已终态(FAILED/CANCELLED/SUPERSEDED):拒绝(无活物可退役,可直接普通提交);
+ * - 崩溃重试(新指令幂等键已存在):幂等重放,绝不生成第二条替代指令;
+ * - 旧指令在途投递一并中止,迟到确认只能得到 command_superseded;
+ * - 新指令是新的业务请求,获得自己的 executionToken(首轮稳定身份自首轮起算);
+ *   lineId 缺省沿用旧指令产线。取代链经 supersedesCommandId / supersededByCommandId 双向可查。
+ */
+export function decideSupersede(
+  oldCommand: Command,
+  oldActiveAttempt: Attempt | null,
+  existingNew: Command | null,
+  req: SupersedeRequest,
+  ctx: Ctx,
+): Decision<SupersedeReply> {
+  if (existingNew) {
+    return {
+      writes: {
+        events: [cmdEv(ctx, existingNew, null, 'SUBMISSION_DEDUPED', { idempotencyKey: req.idempotencyKey, supersedesKey: req.supersedesKey })],
+      },
+      reply: {
+        accepted: true,
+        deduped: true,
+        commandId: existingNew.id,
+        supersededCommandId: existingNew.supersedesCommandId ?? oldCommand.id,
+        executionToken: existingNew.executionToken,
+        lineId: existingNew.lineId,
+      },
+    };
+  }
+
+  if (oldCommand.status === 'SUCCEEDED') {
+    return {
+      writes: {
+        events: [cmdEv(ctx, oldCommand, null, 'SUPERSEDE_REJECTED', { reason: 'already_succeeded', byIdempotencyKey: req.idempotencyKey })],
+      },
+      reply: { accepted: false, reason: 'already_succeeded' },
+    };
+  }
+  if (oldCommand.status !== 'PENDING' && oldCommand.status !== 'DISPATCHED') {
+    return {
+      writes: {
+        events: [cmdEv(ctx, oldCommand, null, 'SUPERSEDE_REJECTED', { reason: 'already_terminal', status: oldCommand.status })],
+      },
+      reply: { accepted: false, reason: 'already_terminal' },
+    };
+  }
+
+  const events: DomainEvent[] = [];
+  let attempt: Attempt | undefined;
+  if (oldCommand.status === 'DISPATCHED' && oldActiveAttempt && oldActiveAttempt.status === 'ACTIVE') {
+    attempt = { ...oldActiveAttempt, status: 'EXPIRED' };
+    events.push(
+      cmdEv(ctx, oldCommand, attempt.id, 'ATTEMPT_ABORTED', {
+        reason: 'command_superseded',
+        attemptNo: attempt.attemptNo,
+        gatewayId: attempt.gatewayId,
+        generation: attempt.generation,
+      }),
+    );
+  }
+
+  const newId = ctx.newId();
+  const lineId = req.lineId ?? oldCommand.lineId;
+  const retired: Command = {
+    ...oldCommand,
+    status: 'SUPERSEDED',
+    activeAttemptId: null,
+    supersededByCommandId: newId,
+    updatedAt: ctx.now,
+  };
+  const created: Command = {
+    id: newId,
+    idempotencyKey: req.idempotencyKey,
+    lineId,
+    action: req.action,
+    params: req.params ?? null,
+    status: 'PENDING',
+    executionToken: `exec-${newId}`,
+    attemptCount: 0,
+    activeAttemptId: null,
+    nextAttemptNotBefore: ctx.now,
+    supersedesCommandId: oldCommand.id,
+    supersededByCommandId: null,
+    createdAt: ctx.now,
+    updatedAt: ctx.now,
+  };
+  events.push(
+    cmdEv(ctx, oldCommand, attempt?.id ?? null, 'COMMAND_SUPERSEDED', { byCommandId: newId, byIdempotencyKey: req.idempotencyKey }),
+    cmdEv(ctx, created, null, 'COMMAND_ACCEPTED', {
+      idempotencyKey: req.idempotencyKey,
+      action: req.action,
+      lineId,
+      supersedesCommandId: oldCommand.id,
+      supersedesKey: req.supersedesKey,
+    }),
+  );
+  return {
+    writes: { command: created, retiredCommand: retired, attempt, events },
+    reply: { accepted: true, deduped: false, commandId: newId, supersededCommandId: oldCommand.id, executionToken: created.executionToken, lineId },
   };
 }

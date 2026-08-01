@@ -3,8 +3,8 @@
  * 本模块不依赖 HTTP、传输协议或任何具体存储,只描述领域概念。
  */
 
-/** 指令(业务请求)的生命周期状态 */
-export type CommandStatus = 'PENDING' | 'DISPATCHED' | 'SUCCEEDED' | 'FAILED';
+/** 指令(业务请求)的生命周期状态;SUCCEEDED/FAILED/CANCELLED/SUPERSEDED 为终态,不可逆 */
+export type CommandStatus = 'PENDING' | 'DISPATCHED' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'SUPERSEDED';
 
 /** 单次投递(租约)的生命周期状态 */
 export type AttemptStatus = 'ACTIVE' | 'ACKED' | 'EXPIRED';
@@ -42,6 +42,10 @@ export interface Command {
   activeAttemptId: string | null;
   /** 下一次允许被领取的最早时间(退避),毫秒时间戳 */
   nextAttemptNotBefore: number;
+  /** 本指令明确取代的指令 id(安全替代指令);无则为 null */
+  supersedesCommandId: string | null;
+  /** 取代本指令的新指令 id(本指令随之进入 SUPERSEDED 终态);无则为 null */
+  supersededByCommandId: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -96,6 +100,11 @@ export type EventType =
   | 'DEVICE_ACK_IGNORED'          // 设备确认已持久化但被忽略(带原因)
   | 'DEVICE_ACK_DUPLICATE'        // 相同 ackId 的重复确认被去重
   | 'COMMAND_SUCCEEDED'           // 指令被标记成功(仅由已持久化的确认触发)
+  | 'COMMAND_CANCELLED'           // 上游紧急撤回(未完成时立即生效)
+  | 'CANCEL_REJECTED'             // 撤回被拒(已成功/已终态,不能伪装成撤回成功)
+  | 'CANCEL_DEDUPED'              // 重复撤回的幂等去重
+  | 'COMMAND_SUPERSEDED'          // 指令被替代指令退役(原子发生于替代提交中)
+  | 'SUPERSEDE_REJECTED'          // 取代被拒(目标已成功/已终态)
   | 'LEASE_EXPIRED'               // 租约超期(网关失联)
   | 'RETRY_SCHEDULED'             // 安排重试(沿用稳定执行身份)
   | 'COMMAND_FAILED';             // 重试耗尽,指令终结失败
