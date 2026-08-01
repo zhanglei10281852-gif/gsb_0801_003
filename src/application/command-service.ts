@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import {
   apply,
   decideAck,
+  decideCancel,
   decideClaim,
   decideExpire,
   decideRenew,
+  decideReplace,
   decideSubmit,
   replay,
   systemEventFactory,
@@ -134,6 +136,145 @@ export class CommandService {
 
   listCommands(): CommandSnapshot[] {
     return this.store.listSnapshots();
+  }
+
+  cancel(input: {
+    commandId: string;
+    reason: string;
+    requestedBy: string;
+    cancelledAt?: number;
+  }): OperationResult {
+    return this.withConcurrencyRetry(() => {
+      const events = this.store.listEvents({ commandId: input.commandId });
+      const state = replay(events);
+      if (!state)
+        return { accepted: false, reason: "COMMAND_NOT_FOUND", events: [] };
+      const decision = decideCancel(
+        state,
+        {
+          commandId: input.commandId,
+          reason: input.reason,
+          requestedBy: input.requestedBy,
+          cancelledAt: input.cancelledAt ?? this.factory.now(),
+        },
+        this.factory,
+      );
+      if (!decision.accepted) {
+        return {
+          accepted: false,
+          reason: decision.reason,
+          events: decision.events,
+        };
+      }
+      const snapshot = apply(state, decision.events[0]);
+      this.store.append(
+        input.commandId,
+        state.version,
+        decision.events,
+        snapshot,
+      );
+      return { accepted: true, snapshot, events: decision.events };
+    });
+  }
+
+  replace(input: {
+    oldCommandId: string;
+    newIdempotencyKey: string;
+    reason: string;
+    requestedBy: string;
+    replacementPayload: CommandPayload;
+    newCommandId?: string;
+    replacedAt?: number;
+  }): OperationResult & {
+    newCommandId?: string;
+    oldSnapshot?: CommandSnapshot;
+    newSnapshot?: CommandSnapshot;
+  } {
+    return this.withConcurrencyRetry(() => {
+      const oldEvents = this.store.listEvents({
+        commandId: input.oldCommandId,
+      });
+      const oldState = replay(oldEvents);
+      if (!oldState) {
+        return { accepted: false, reason: "COMMAND_NOT_FOUND", events: [] };
+      }
+
+      const existingNew = this.store.getSnapshotByIdempotencyKey(
+        input.newIdempotencyKey,
+      );
+      if (existingNew) {
+        if (existingNew.supersedesCommandId !== input.oldCommandId) {
+          return {
+            accepted: false,
+            reason: "IDEMPOTENCY_KEY_CONFLICT",
+            events: [],
+          };
+        }
+        const currentOld = this.store.getSnapshot(input.oldCommandId)!;
+        return {
+          accepted: currentOld.state === "CANCELLED",
+          reason:
+            currentOld.state === "CANCELLED"
+              ? undefined
+              : `OLD_STATE_${currentOld.state}`,
+          events: [],
+          newCommandId: existingNew.commandId,
+          oldSnapshot: currentOld,
+          newSnapshot: existingNew,
+        };
+      }
+
+      const newCommandId = input.newCommandId ?? randomUUID();
+      const decision = decideReplace(
+        oldState,
+        {
+          oldCommandId: input.oldCommandId,
+          newCommandId,
+          newIdempotencyKey: input.newIdempotencyKey,
+          deviceId: oldState.deviceId,
+          replacementPayload: input.replacementPayload,
+          reason: input.reason,
+          requestedBy: input.requestedBy,
+          replacedAt: input.replacedAt ?? this.factory.now(),
+        },
+        this.factory,
+      );
+      if (!decision.accepted) {
+        return {
+          accepted: false,
+          reason: decision.reason,
+          events: decision.events,
+        };
+      }
+
+      const supersededEvent = decision.events[0];
+      const submittedEvent = decision.events[1];
+      const newSnapshot = replay([submittedEvent])!;
+      const oldSnapshot = apply(oldState, supersededEvent);
+
+      this.store.appendBatch([
+        {
+          commandId: input.oldCommandId,
+          expectedVersion: oldState.version,
+          events: [supersededEvent],
+          snapshotAfter: oldSnapshot,
+        },
+        {
+          commandId: newCommandId,
+          expectedVersion: 0,
+          events: [submittedEvent],
+          snapshotAfter: newSnapshot,
+        },
+      ]);
+
+      return {
+        accepted: true,
+        events: decision.events,
+        newCommandId,
+        oldSnapshot,
+        newSnapshot,
+      };
+    });
   }
 
   claimOne(input: {

@@ -88,6 +88,29 @@ export class ApiClient {
     return this.request<{ expired: number }>('POST', '/v1/admin/sweep', {});
   }
 
+  cancel(commandId: string, reason?: string, requestedBy?: string) {
+    return this.request(
+      'POST',
+      `/v1/upstream/commands/${commandId}/cancel`,
+      { reason: reason ?? 'EMERGENCY_CANCEL', requestedBy },
+      requestedBy ? { 'x-requested-by': requestedBy } : {}
+    );
+  }
+
+  replace(
+    oldCommandId: string,
+    newIdempotencyKey: string,
+    payload: { type: string; params?: Record<string, unknown> },
+    reason?: string
+  ) {
+    return this.request(
+      'POST',
+      `/v1/upstream/commands/${oldCommandId}/replace`,
+      { payload, reason: reason ?? 'REPLACED_BY_SAFE_COMMAND' },
+      { 'idempotency-key': newIdempotencyKey }
+    );
+  }
+
   adminEvents(limit = 200) {
     return this.request<{ events: unknown[] }>('GET', `/v1/admin/events?limit=${limit}`);
   }

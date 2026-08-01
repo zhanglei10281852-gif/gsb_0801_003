@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import {
   createEventFactory,
   decideAck,
+  decideCancel,
   decideClaim,
   decideExpire,
   decideRenew,
+  decideReplace,
   decideSubmit,
   replay,
 } from "./command.js";
@@ -392,4 +394,180 @@ test("event apply is deterministic and append enforces optimistic version", () =
   );
   const loaded = store.getSnapshot("cmd-1")!;
   assert.deepEqual(loaded, replay(decision.events));
+});
+
+test("cancel moves pending or claimed to CANCELLED and is terminal", () => {
+  const state = replay(baseSubmit().events)!;
+  const cancel = decideCancel(
+    state,
+    {
+      commandId: "cmd-1",
+      reason: "ABORT",
+      requestedBy: "ops",
+      cancelledAt: 1200,
+    },
+    factory,
+  );
+  assert.equal(cancel.accepted, true);
+  const cancelled = replay([...baseSubmit().events, ...cancel.events])!;
+  assert.equal(cancelled.state, "CANCELLED");
+  assert.equal(cancelled.supersededByCommandId, undefined);
+
+  const reclaim = decideClaim(
+    cancelled,
+    {
+      gatewayId: "gw",
+      leaseId: "l",
+      leaseDurationMs: 100,
+      claimedAt: 1300,
+      maxAttempts: 3,
+    },
+    factory,
+  );
+  assert.match(reclaim.reason ?? "", /TERMINAL/);
+});
+
+test("a delivered command cannot be cancelled or replaced", () => {
+  const stream = baseSubmit().events;
+  const claim = decideClaim(
+    replay(stream)!,
+    {
+      gatewayId: "gw",
+      leaseId: "l",
+      leaseDurationMs: 100,
+      claimedAt: 1100,
+      maxAttempts: 3,
+    },
+    factory,
+  );
+  const ack = decideAck(
+    replay([...stream, ...claim.events])!,
+    {
+      gatewayId: "gw",
+      leaseId: "l",
+      generation: 1,
+      ackCode: "OK",
+      success: true,
+      receivedAt: 1150,
+    },
+    factory,
+  );
+  const delivered = replay([...stream, ...claim.events, ...ack.events])!;
+  assert.equal(
+    decideCancel(
+      delivered,
+      {
+        commandId: "cmd-1",
+        reason: "x",
+        requestedBy: "ops",
+        cancelledAt: 1200,
+      },
+      factory,
+    ).reason,
+    "ALREADY_DELIVERED",
+  );
+  assert.equal(
+    decideReplace(
+      delivered,
+      {
+        oldCommandId: "cmd-1",
+        newCommandId: "cmd-2",
+        newIdempotencyKey: "k2",
+        deviceId: "d",
+        replacementPayload: { type: "RESET" },
+        reason: "x",
+        requestedBy: "ops",
+        replacedAt: 1200,
+      },
+      factory,
+    ).reason,
+    "OLD_ALREADY_DELIVERED",
+  );
+});
+
+test("replace atomically supersedes old command and creates a linked replacement", () => {
+  const oldState = replay(baseSubmit().events)!;
+  const decision = decideReplace(
+    oldState,
+    {
+      oldCommandId: "cmd-1",
+      newCommandId: "cmd-2",
+      newIdempotencyKey: "idem-2",
+      deviceId: "dev-1",
+      replacementPayload: { type: "SAFE_STOP" },
+      reason: "UNSAFE",
+      requestedBy: "ops",
+      replacedAt: 1500,
+    },
+    factory,
+  );
+  assert.equal(decision.accepted, true);
+  assert.equal(decision.events[0].type, "CommandSuperseded");
+  assert.equal(decision.events[1].type, "CommandSubmitted");
+
+  const oldAfter = replay([...baseSubmit().events, decision.events[0]])!;
+  const newAfter = replay([decision.events[1]])!;
+  assert.equal(oldAfter.state, "CANCELLED");
+  assert.equal(oldAfter.supersededByCommandId, "cmd-2");
+  assert.equal(newAfter.state, "PENDING");
+  assert.equal(newAfter.supersedesCommandId, "cmd-1");
+
+  const staleAck = decideAck(
+    oldAfter,
+    {
+      gatewayId: "gw",
+      leaseId: "l",
+      generation: 99,
+      ackCode: "LATE",
+      success: true,
+      receivedAt: 1600,
+    },
+    factory,
+  );
+  assert.match(staleAck.reason ?? "", /TERMINAL/);
+});
+
+test("service replace writes both aggregates atomically and is idempotent", () => {
+  const store = new InMemoryEventStore();
+  const svc = new CommandService(
+    store,
+    { leaseDurationMs: 100, maxAttempts: 3, claimBatchSize: 5 },
+    factory,
+  );
+  svc.submit({
+    idempotencyKey: "old",
+    deviceId: "dev",
+    payload: { type: "CALIBRATE" },
+    submittedAt: 1000,
+  });
+  const old = svc.getByIdempotencyKey("old")!;
+  const first = svc.replace({
+    oldCommandId: old.commandId,
+    newIdempotencyKey: "new",
+    reason: "SAFE",
+    requestedBy: "ops",
+    replacementPayload: { type: "SAFE_STOP" },
+    replacedAt: 1100,
+  });
+  assert.equal(first.accepted, true);
+  assert.equal(first.oldSnapshot!.state, "CANCELLED");
+  assert.equal(first.newSnapshot!.supersedesCommandId, old.commandId);
+
+  const oldAfter = store.getSnapshot(old.commandId)!;
+  const newAfter = store.getSnapshot(first.newCommandId!)!;
+  assert.equal(oldAfter.state, "CANCELLED");
+  assert.equal(oldAfter.supersededByCommandId, first.newCommandId);
+  assert.equal(newAfter.state, "PENDING");
+
+  const again = svc.replace({
+    oldCommandId: old.commandId,
+    newIdempotencyKey: "new",
+    reason: "SAFE",
+    requestedBy: "ops",
+    replacementPayload: { type: "SAFE_STOP" },
+    replacedAt: 1200,
+  });
+  assert.equal(again.accepted, true);
+  assert.equal(again.newCommandId, first.newCommandId);
+  assert.equal(svc.getByIdempotencyKey("new")!.commandId, first.newCommandId);
 });

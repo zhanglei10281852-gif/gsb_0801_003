@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type {
   AckInput,
+  CancelInput,
   ClaimInput,
   CommandSnapshot,
   Decision,
   DomainEvent,
   ExpireInput,
   RenewInput,
+  ReplaceInput,
   SubmitCommandInput,
 } from "./types.js";
 
@@ -47,6 +49,8 @@ export function apply(
         version: event.version,
         attempt: 0,
         generation: 0,
+        supersedesCommandId:
+          (event.data.supersedesCommandId as string | undefined) ?? undefined,
         createdAt: event.occurredAt,
         updatedAt: event.recordedAt,
       };
@@ -115,6 +119,37 @@ export function apply(
         terminalReason: event.data.reason as string,
         updatedAt: event.recordedAt,
       };
+    case "CommandCancelled":
+      if (!state) throw new Error("invalid event stream");
+      return {
+        ...state,
+        state: "CANCELLED",
+        version: event.version,
+        gatewayId: undefined,
+        leaseId: undefined,
+        leaseExpiresAt: undefined,
+        cancelledAt: event.occurredAt,
+        cancelledBy: event.data.requestedBy as string,
+        cancelReason: event.data.reason as string,
+        terminalReason: event.data.reason as string,
+        updatedAt: event.recordedAt,
+      };
+    case "CommandSuperseded":
+      if (!state) throw new Error("invalid event stream");
+      return {
+        ...state,
+        state: "CANCELLED",
+        version: event.version,
+        gatewayId: undefined,
+        leaseId: undefined,
+        leaseExpiresAt: undefined,
+        cancelledAt: event.occurredAt,
+        cancelledBy: event.data.requestedBy as string,
+        cancelReason: event.data.reason as string,
+        supersededByCommandId: event.data.replacementCommandId as string,
+        terminalReason: `SUPERSEDED_BY_${event.data.replacementCommandId as string}`,
+        updatedAt: event.recordedAt,
+      };
     default:
       if (!state) throw new Error("invalid event stream");
       return { ...state, version: event.version, updatedAt: event.recordedAt };
@@ -154,7 +189,8 @@ function terminal(state: CommandSnapshot | undefined): boolean {
   return (
     state?.state === "DELIVERED" ||
     state?.state === "FAILED" ||
-    state?.state === "TIMED_OUT"
+    state?.state === "TIMED_OUT" ||
+    state?.state === "CANCELLED"
   );
 }
 
@@ -412,4 +448,106 @@ export function decideExpire(
   if (events.length === 0)
     return { accepted: false, events: [], reason: "NOT_DUE" };
   return { accepted: true, events, result: { state: current.state } };
+}
+
+export function decideCancel(
+  state: CommandSnapshot | undefined,
+  input: CancelInput,
+  factory: EventFactory,
+): Decision {
+  if (!state)
+    return { accepted: false, events: [], reason: "COMMAND_NOT_FOUND" };
+  if (state.state === "DELIVERED")
+    return { accepted: false, events: [], reason: "ALREADY_DELIVERED" };
+  if (state.state === "FAILED")
+    return { accepted: false, events: [], reason: "ALREADY_FAILED" };
+  if (state.state === "TIMED_OUT")
+    return { accepted: false, events: [], reason: "ALREADY_TIMED_OUT" };
+  if (state.state === "CANCELLED")
+    return { accepted: false, events: [], reason: "ALREADY_CANCELLED" };
+
+  const event = makeEvent(
+    state,
+    "CommandCancelled",
+    {
+      reason: input.reason,
+      requestedBy: input.requestedBy,
+      oldGatewayId: state.gatewayId ?? null,
+      oldLeaseId: state.leaseId ?? null,
+      oldGeneration: state.generation,
+    },
+    "CANCEL",
+    input.cancelledAt,
+    factory,
+    input.commandId,
+  );
+  return {
+    accepted: true,
+    events: [event],
+    result: { state: "CANCELLED" as const },
+  };
+}
+
+export function decideReplace(
+  oldState: CommandSnapshot | undefined,
+  input: ReplaceInput,
+  factory: EventFactory,
+): Decision {
+  if (!oldState)
+    return { accepted: false, events: [], reason: "COMMAND_NOT_FOUND" };
+  if (oldState.state === "DELIVERED")
+    return { accepted: false, events: [], reason: "OLD_ALREADY_DELIVERED" };
+  if (oldState.state === "FAILED")
+    return { accepted: false, events: [], reason: "OLD_ALREADY_FAILED" };
+  if (oldState.state === "TIMED_OUT")
+    return { accepted: false, events: [], reason: "OLD_ALREADY_TIMED_OUT" };
+  if (oldState.state === "CANCELLED")
+    return { accepted: false, events: [], reason: "OLD_ALREADY_CANCELLED" };
+
+  const events: DomainEvent[] = [];
+
+  const superseded = makeEvent(
+    oldState,
+    "CommandSuperseded",
+    {
+      replacementCommandId: input.newCommandId,
+      replacementIdempotencyKey: input.newIdempotencyKey,
+      reason: input.reason,
+      requestedBy: input.requestedBy,
+      oldGatewayId: oldState.gatewayId ?? null,
+      oldLeaseId: oldState.leaseId ?? null,
+      oldGeneration: oldState.generation,
+    },
+    "REPLACE",
+    input.replacedAt,
+    factory,
+    input.oldCommandId,
+  );
+  events.push(superseded);
+
+  const submitted = makeEvent(
+    undefined,
+    "CommandSubmitted",
+    {
+      commandId: input.newCommandId,
+      idempotencyKey: input.newIdempotencyKey,
+      deviceId: input.deviceId,
+      payload: input.replacementPayload,
+      supersedesCommandId: input.oldCommandId,
+    },
+    "REPLACE",
+    input.replacedAt,
+    factory,
+    input.newIdempotencyKey,
+  );
+  events.push(submitted);
+
+  return {
+    accepted: true,
+    events,
+    result: {
+      oldState: "CANCELLED" as const,
+      newCommandId: input.newCommandId,
+    },
+  };
 }

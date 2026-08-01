@@ -54,6 +54,8 @@ PENDING --claim(leaseId, generation+1, attempt+1)--> CLAIMED
 CLAIMED --renew(matching generation)----------------> CLAIMED
 CLAIMED --ack success(matching generation)----------> DELIVERED (terminal)
 CLAIMED --ack failure/nack(matching generation)-----> FAILED    (terminal)
+PENDING/CLAIMED --cancel----------------------------> CANCELLED (terminal)
+PENDING/CLAIMED --replace---------------------------> CANCELLED (terminal) + 新 PENDING
 CLAIMED --lease expiry------------------------------> PENDING
 PENDING --max attempts or max age-------------------> TIMED_OUT (terminal)
 ```
@@ -64,17 +66,22 @@ PENDING --max attempts or max age-------------------> TIMED_OUT (terminal)
 - **所有权代际 `generation`（fencing token）**：每次成功领取（包括首轮领取和接管后的重新领取）都会让该指令的 `generation` 单调加 1。同一产线挂两台冗余网关时，主网关心跳中断、租约到期后备用网关接管，旧主网关的代际立即过期。
 - 每次网关领取生成新的 `leaseId`，网关必须在后续续约和确认中同时携带匹配的 `gatewayId + leaseId + generation`。旧代际的续约和确认即使迟到，也会以 `STALE_GENERATION` 被拒绝，不能推进状态或复活终态。
 - 只有设备确认被写入事件存储后，状态才能进入 `DELIVERED` 或 `FAILED`。
-- 终态（`DELIVERED`、`FAILED`、`TIMED_OUT`）不可被迟到 ACK、重复 ACK、新的领取或旧租约/旧代际复活。
-- 状态不仅保存最终值，还保存完整事件流；每个事件都有 `causedBy` 和 `causationId`，`CommandClaimed` 记录新旧代际与新旧网关，`DeviceAckRecorded` 记录实际成功的代际，可还原一次接管前后的因果关系。
+- **紧急撤回**：上游可撤回尚未完成（`PENDING`/`CLAIMED`）的指令，进入终态 `CANCELLED` 并记录 `CommandCancelled`。撤回会清除当前租约，失联网关重连后的迟到确认会被终态/旧代际拒绝。
+- **替代指令**：上游可对未完成指令提交一条明确取代它的安全指令。旧指令在同一 SQLite 事务中原子地进入 `CANCELLED`（事件 `CommandSuperseded`，指向新指令），新指令以 `CommandSubmitted` 建立并通过 `supersedesCommandId` 反向指回旧指令，形成可查询的双向因果链。替代是幂等的：使用相同的新指令幂等键重试不会产生第二条替代指令。
+- **已确认动作不能伪装成撤回成功**：`DELIVERED`/`FAILED`/`TIMED_OUT`/`CANCELLED` 的指令撤回或替代会被拒绝（如 `ALREADY_DELIVERED`/`OLD_ALREADY_DELIVERED`），状态保持不变。
+- 终态（`DELIVERED`、`FAILED`、`TIMED_OUT`、`CANCELLED`）不可被迟到 ACK、重复 ACK、新的领取或旧租约/旧代际复活。
+- 状态不仅保存最终值，还保存完整事件流；每个事件都有 `causedBy` 和 `causationId`，`CommandClaimed` 记录新旧代际与新旧网关，`CommandSuperseded` 记录被谁取代，`DeviceAckRecorded` 记录实际成功的代际，可还原接管、取代、拒绝和迟到回执前后的因果关系。
 
 ### 事件类型
 
-- `CommandSubmitted`
+- `CommandSubmitted`（替代产生的新指令会带 `supersedesCommandId`）
 - `CommandClaimed`
 - `LeaseRenewed`
 - `LeaseExpired`
 - `DeviceAckRecorded`
 - `DeviceNackRecorded`
+- `CommandCancelled`
+- `CommandSuperseded`
 - `CommandTimedOut`
 
 可通过 `GET /v1/upstream/commands/{commandId}/events` 查看单条指令事件流，通过 `GET /v1/admin/events` 查看全局事件。
@@ -103,6 +110,31 @@ GET /v1/upstream/commands/{commandId}
 GET /v1/upstream/commands/{commandId}/events
 GET /v1/upstream/commands?idempotencyKey=biz-order-123
 ```
+
+命令视图包含 `supersededByCommandId`（本命令被哪条新指令取代）和 `supersedesCommandId`（本指令取代了哪条旧指令），可沿这两个字段串起取代因果链。
+
+### 紧急撤回
+
+```http
+POST /v1/upstream/commands/{commandId}/cancel
+Content-Type: application/json
+
+{ "reason": "OPERATOR_ABORT" }
+```
+
+只能撤回 `PENDING`/`CLAIMED` 状态的指令。对已 `DELIVERED` 的指令返回 `409 ALREADY_DELIVERED`，不会把已执行动作伪装成撤回成功。
+
+### 替代指令
+
+```http
+POST /v1/upstream/commands/{oldCommandId}/replace
+Idempotency-Key: safe-order-456
+Content-Type: application/json
+
+{ "payload": { "type": "SAFE_STOP", "params": {} }, "reason": "UNSAFE_RECIPE" }
+```
+
+原子完成两件事：旧指令进入 `CANCELLED`（`CommandSuperseded` 指向新指令），新指令进入 `PENDING` 并反向指回旧指令。对已交付的旧指令返回 `409 OLD_ALREADY_DELIVERED`。使用相同的新指令幂等键重试是幂等的，返回同一条替代指令。
 
 ### 网关领取任务
 
@@ -188,8 +220,12 @@ Content-Type: application/json
 - `duplicate-ack`：设备重复确认，第二次被拒绝。
 - `wrong-lease`：错误或乱序的 `leaseId` 无法续约或确认。
 - `nack`：设备否定确认进入 `FAILED`。
+- `cancel`：撤回未完成指令进入 `CANCELLED`。
+- `cancel-delivered-rejected`：已 `DELIVERED` 的动作不能被撤回，拒绝伪装成撤回成功。
+- `replace`：用安全指令原子取代未完成指令，双向因果链接、新指令可被领取确认，替代重试幂等。
+- `three-round`：第 1 轮主网关代际 1、第 2 轮备用网关代际 2 接管并隔离第 1 轮迟到确认、第 3 轮上游用安全指令取代并隔离第 2 轮迟到确认，最终新稳定身份交付，旧指令保留完整因果链。
 
-端到端验收还会真实启动多个服务实例：一个在提交事件持久化后、响应前崩溃并重启复用同一数据库；另一个在主网关领取代际 1 后重启进程，验证代际随 SQLite 持久化保留，备用网关重启后仍能以代际 2 接管并隔离旧代际迟到确认。
+端到端验收还会真实启动多个服务实例：一个在提交事件持久化后、响应前崩溃并重启复用同一数据库；一个在主网关领取代际 1 后重启进程，验证代际随 SQLite 持久化保留；以及一个在替代事务提交后、响应前崩溃并重启，验证旧指令保持 `CANCELLED`、新指令及其双向链接存活、旧代际继续被隔离、替代重试幂等。
 
 ## 交付保证
 
@@ -197,9 +233,11 @@ Content-Type: application/json
 2. **稳定执行身份**：重试、主备接管和重新领取不创建新指令，只在同一 `commandId` 下增加 `attempt` 并生成新的租约/代际事件。
 3. **代际隔离（fencing）**：每次接管使 `generation` 单调递增，旧网关的续约与确认因 `STALE_GENERATION` 被拒绝；进程重启后代际从 SQLite 恢复，旧代际不会因迟到消息复活指令。
 4. **确认即落盘**：只有携带当前代际的 `DeviceAckRecorded` 或 `DeviceNackRecorded` 已进入 SQLite 事务，状态才会被标记为成功或失败。
-5. **终态不可复活**：成功、失败、超时后的迟到/重复/错误租约或旧代际消息都会被拒绝。
-6. **因果可追溯**：每次投递、续约、过期、接管、重试、确认和超时都作为事件保存，`CommandClaimed` 记录新旧代际与网关，包含来源和因果关联。
-7. **本地可运行**：只需 Node.js 20、npm install 和 SQLite 文件，不依赖外部服务。
+5. **撤回/取代不伪造成功**：撤回和替代只能作用于未完成指令；已被设备确认执行的动作会被明确拒绝，状态保持 `DELIVERED`，不会被伪装成撤回成功。
+6. **取代原子且可追溯**：旧指令的 `CommandSuperseded` 与新指令的 `CommandSubmitted` 在同一事务写入，双向链接构成可查询因果链；替代重试幂等。
+7. **终态不可复活**：成功、失败、超时、撤回后的迟到/重复/错误租约或旧代际消息都会被拒绝。
+8. **因果可追溯**：每次投递、续约、过期、接管、取代、重试、确认和超时都作为事件保存，`CommandClaimed` 记录新旧代际与网关，`CommandSuperseded` 记录取代关系，包含来源和因果关联。
+9. **本地可运行**：只需 Node.js 20、npm install 和 SQLite 文件，不依赖外部服务。
 
 ## 无法做到的语义和恢复边界
 

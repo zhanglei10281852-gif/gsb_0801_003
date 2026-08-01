@@ -56,6 +56,11 @@ function commandView(
         }
       : undefined,
     deliveredAt: cmd.deliveredAt,
+    cancelledAt: cmd.cancelledAt,
+    cancelledBy: cmd.cancelledBy,
+    cancelReason: cmd.cancelReason,
+    supersededByCommandId: cmd.supersededByCommandId,
+    supersedesCommandId: cmd.supersedesCommandId,
     terminalReason: cmd.terminalReason,
     createdAt: cmd.createdAt,
     updatedAt: cmd.updatedAt,
@@ -283,6 +288,78 @@ export function createApp(config: AppConfig) {
         }
         maybeCrash("afterCommit");
         sendJson(res, 200, commandView(result.snapshot));
+        return;
+      }
+
+      const cancelMatch = path.match(
+        /^\/v1\/upstream\/commands\/([^/]+)\/cancel$/,
+      );
+      if (cancelMatch && method === "POST") {
+        const commandId = decodeURIComponent(cancelMatch[1]);
+        const body = (await readJson(req)) as Record<string, unknown>;
+        const requestedBy =
+          (getHeader(req, "x-requested-by") as string) ??
+          (body.requestedBy as string) ??
+          "upstream";
+        const result = service.cancel({
+          commandId,
+          reason: (body.reason as string) ?? "EMERGENCY_CANCEL",
+          requestedBy,
+        });
+        if (!result.accepted) {
+          sendJson(res, 409, { accepted: false, reason: result.reason });
+          return;
+        }
+        maybeCrash("afterCommit");
+        sendJson(res, 200, commandView(result.snapshot));
+        return;
+      }
+
+      const replaceMatch = path.match(
+        /^\/v1\/upstream\/commands\/([^/]+)\/replace$/,
+      );
+      if (replaceMatch && method === "POST") {
+        const oldCommandId = decodeURIComponent(replaceMatch[1]);
+        const body = (await readJson(req)) as Record<string, unknown>;
+        const newIdempotencyKey =
+          (getHeader(req, "idempotency-key") as string) ??
+          (body.idempotencyKey as string) ??
+          (body.newIdempotencyKey as string);
+        if (
+          !newIdempotencyKey ||
+          !body.payload ||
+          typeof body.payload !== "object"
+        ) {
+          sendJson(res, 400, {
+            error: "INVALID_REQUEST",
+            required: ["idempotency-key", "payload"],
+          });
+          return;
+        }
+        const requestedBy =
+          (getHeader(req, "x-requested-by") as string) ??
+          (body.requestedBy as string) ??
+          "upstream";
+        const result = service.replace({
+          oldCommandId,
+          newIdempotencyKey: newIdempotencyKey as string,
+          reason: (body.reason as string) ?? "REPLACED_BY_SAFE_COMMAND",
+          requestedBy,
+          replacementPayload: body.payload as {
+            type: string;
+            params?: Record<string, unknown>;
+          },
+        });
+        if (!result.accepted) {
+          sendJson(res, 409, { accepted: false, reason: result.reason });
+          return;
+        }
+        maybeCrash("afterCommit");
+        sendJson(res, 200, {
+          old: commandView(result.oldSnapshot),
+          replacement: commandView(result.newSnapshot),
+          newCommandId: result.newCommandId,
+        });
         return;
       }
 

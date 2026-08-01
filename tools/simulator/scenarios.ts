@@ -380,6 +380,223 @@ export async function scenarioDualGatewayFailover(
   );
 }
 
+export async function scenarioCancel(client: ApiClient): Promise<ScenarioResult> {
+  const key = uniqueKey("cancel");
+  const submit = await client.submit({
+    idempotencyKey: key,
+    deviceId: "device-cancel",
+    payload: { type: "CALIBRATE" },
+  });
+  const cmdId = (submit.body as { commandId: string }).commandId;
+  const cancelled = await client.cancel(cmdId, "OPERATOR_ABORT", "operator");
+  if (cancelled.status !== 200)
+    return fail("cancel", ["cancel not accepted"], { body: cancelled.body });
+  const final = (await client.getCommand(cmdId, true)).body as {
+    state: string;
+    events: { type: string; causedBy: string }[];
+  };
+  if (final.state !== "CANCELLED")
+    return fail("cancel", ["state not CANCELLED", final.state]);
+  if (!final.events.some((e) => e.type === "CommandCancelled"))
+    return fail("cancel", ["CommandCancelled event missing"]);
+  return ok("cancel", ["pending command cancelled and event recorded"]);
+}
+
+export async function scenarioCancelDeliveredRejected(
+  client: ApiClient,
+): Promise<ScenarioResult> {
+  const key = uniqueKey("cancel-delivered");
+  const submit = await client.submit({
+    idempotencyKey: key,
+    deviceId: "device-cancel-done",
+    payload: { type: "CALIBRATE" },
+  });
+  const cmdId = (submit.body as { commandId: string }).commandId;
+  const gw = new GatewaySimulator("gw-cancel-done", client, immediateAckDevice);
+  const leased = await gw.pollOnce(undefined, cmdId);
+  if (!leased) return fail("cancel-delivered", ["claim failed"]);
+  const ack = await gw.ack(leased);
+  if (ack.status !== 200)
+    return fail("cancel-delivered", ["ack failed", String(ack.status)]);
+  const cancelAttempt = await client.cancel(cmdId, "TOO_LATE", "operator");
+  if (cancelAttempt.status !== 409)
+    return fail("cancel-delivered", ["cancelling a delivered command must be rejected"], {
+      status: cancelAttempt.status,
+    });
+  const final = (await client.getCommand(cmdId)).body as { state: string };
+  if (final.state !== "DELIVERED")
+    return fail("cancel-delivered", ["delivered state must not be disguised as cancel"]);
+  return ok("cancel-delivered", [
+    "delivered action cannot be disguised as a successful cancel",
+  ]);
+}
+
+export async function scenarioReplace(client: ApiClient): Promise<ScenarioResult> {
+  const key = uniqueKey("replace-old");
+  const submit = await client.submit({
+    idempotencyKey: key,
+    deviceId: "device-replace",
+    payload: { type: "SWITCH_RECIPE", params: { recipe: "X" } },
+  });
+  const oldCmdId = (submit.body as { commandId: string }).commandId;
+  const newKey = uniqueKey("replace-new");
+  const replaced = await client.replace(
+    oldCmdId,
+    newKey,
+    { type: "SAFE_STOP", params: { reason: "emergency" } },
+    "UNSAFE_RECIPE",
+  );
+  if (replaced.status !== 200)
+    return fail("replace", ["replace not accepted"], { body: replaced.body });
+  const body = replaced.body as {
+    newCommandId: string;
+    old: { state: string; supersededByCommandId?: string };
+    replacement: { state: string; supersedesCommandId?: string };
+  };
+  if (body.old.state !== "CANCELLED" || body.replacement.state !== "PENDING")
+    return fail("replace", ["old should be CANCELLED, new should be PENDING"]);
+  if (
+    body.old.supersededByCommandId !== body.newCommandId ||
+    body.replacement.supersedesCommandId !== oldCmdId
+  ) {
+    return fail("replace", ["bidirectional supersession links missing"]);
+  }
+
+  const oldHistory = (await client.getCommand(oldCmdId, true)).body as {
+    events: { type: string; data: Record<string, unknown> }[];
+  };
+  const superseded = oldHistory.events.find((e) => e.type === "CommandSuperseded");
+  if (!superseded || superseded.data.replacementCommandId !== body.newCommandId) {
+    return fail("replace", ["old command causal chain missing supersession"]);
+  }
+
+  const gw = new GatewaySimulator("gw-replace", client, immediateAckDevice);
+  const leased = await gw.pollOnce(5000, body.newCommandId);
+  if (!leased) return fail("replace", ["replacement not claimable"]);
+  const ack = await gw.ack(leased);
+  if (ack.status !== 200)
+    return fail("replace", ["replacement ack failed", String(ack.status)]);
+
+  const duplicate = await client.replace(
+    oldCmdId,
+    newKey,
+    { type: "SAFE_STOP" },
+    "DUPLICATE",
+  );
+  if (duplicate.status !== 200)
+    return fail("replace", ["idempotent replace retry should return same result"], {
+      status: duplicate.status,
+    });
+  const dupBody = duplicate.body as { newCommandId: string };
+  if (dupBody.newCommandId !== body.newCommandId)
+    return fail("replace", ["replace retry changed new command id"]);
+
+  return ok("replace", [
+    "old command CANCELLED and linked to replacement",
+    "replacement claimed, acked and delivered under a new stable identity",
+    "replace retry is idempotent",
+  ]);
+}
+
+export async function scenarioThreeRoundTakeoverAndReplace(
+  client: ApiClient,
+): Promise<ScenarioResult> {
+  const key = uniqueKey("three-round");
+  const submit = await client.submit({
+    idempotencyKey: key,
+    deviceId: "device-three-round",
+    payload: { type: "SWITCH_RECIPE", params: { recipe: "Y" } },
+  });
+  const firstCmdId = (submit.body as { commandId: string }).commandId;
+
+  const gw1 = new GatewaySimulator("gw-round-1", client, immediateAckDevice);
+  const lease1 = await gw1.pollOnce(300, firstCmdId);
+  if (!lease1 || lease1.generation !== 1)
+    return fail("three-round", ["round-1 claim failed"]);
+
+  await new Promise((r) => setTimeout(r, 400));
+  const gw2 = new GatewaySimulator("gw-round-2", client, immediateAckDevice);
+  const lease2 = await gw2.pollOnce(3000, firstCmdId);
+  if (!lease2 || lease2.generation !== 2)
+    return fail("three-round", ["round-2 takeover failed"]);
+
+  const lateFrom1 = await GatewaySimulator.staleGenerationAck(
+    client,
+    gw1.gatewayId,
+    firstCmdId,
+    lease1.leaseId,
+    lease1.generation,
+  );
+  if (lateFrom1.status === 200)
+    return fail("three-round", ["round-1 stale ack must be fenced after takeover"]);
+
+  const replaceKey = uniqueKey("three-round-safe");
+  const replaced = await client.replace(
+    firstCmdId,
+    replaceKey,
+    { type: "SAFE_STOP", params: { round: 3 } },
+    "ROUND_3_SAFE_COMMAND",
+  );
+  if (replaced.status !== 200)
+    return fail("three-round", ["round-3 replace not accepted"], {
+      body: replaced.body,
+    });
+  const replaceBody = replaced.body as {
+    newCommandId: string;
+    old: { state: string };
+  };
+
+  const lateFrom2 = await GatewaySimulator.staleGenerationAck(
+    client,
+    gw2.gatewayId,
+    firstCmdId,
+    lease2.leaseId,
+    lease2.generation,
+  );
+  if (lateFrom2.status === 200)
+    return fail("three-round", [
+      "round-2 stale ack must be fenced after round-3 replacement",
+    ]);
+
+  const gw3 = new GatewaySimulator("gw-round-3", client, immediateAckDevice);
+  const lease3 = await gw3.pollOnce(5000, replaceBody.newCommandId);
+  if (!lease3 || lease3.generation !== 1)
+    return fail("three-round", ["round-3 replacement claim failed"]);
+  const ack3 = await gw3.ack(lease3);
+  if (ack3.status !== 200)
+    return fail("three-round", ["round-3 ack failed", String(ack3.status)]);
+
+  const oldFinal = (await client.getCommand(firstCmdId, true)).body as {
+    state: string;
+    supersededByCommandId?: string;
+    events: { type: string; data: Record<string, unknown> }[];
+  };
+  const newFinal = (await client.getCommand(replaceBody.newCommandId)).body as {
+    state: string;
+    supersedesCommandId?: string;
+  };
+  const chain = oldFinal.events.map((e) => e.type);
+  if (
+    oldFinal.state !== "CANCELLED" ||
+    oldFinal.supersededByCommandId !== replaceBody.newCommandId ||
+    newFinal.state !== "DELIVERED" ||
+    newFinal.supersedesCommandId !== firstCmdId ||
+    !chain.includes("CommandClaimed") ||
+    !chain.includes("CommandSuperseded")
+  ) {
+    return fail("three-round", ["three-round causal chain inconsistent"], {
+      oldState: oldFinal.state,
+      newState: newFinal.state,
+      chain,
+    });
+  }
+  return ok("three-round", [
+    "round 1 owned generation 1; round 2 took over generation 2 and fenced round-1 ack",
+    "round 3 replaced with a safe command and fenced round-2 late ack",
+    "replacement delivered as new stable identity; old command CANCELLED with full causal chain",
+  ]);
+}
+
 export const builtInScenarios: Record<
   string,
   (client: ApiClient) => Promise<ScenarioResult>
@@ -391,6 +608,10 @@ export const builtInScenarios: Record<
   "wrong-lease": scenarioOutOfOrderAndWrongLease,
   nack: scenarioNackFailure,
   failover: scenarioDualGatewayFailover,
+  cancel: scenarioCancel,
+  "cancel-delivered-rejected": scenarioCancelDeliveredRejected,
+  replace: scenarioReplace,
+  "three-round": scenarioThreeRoundTakeoverAndReplace,
 };
 
 export function customDevice(mode: "ack" | "nack" | "slow"): DeviceBehavior {

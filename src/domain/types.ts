@@ -2,6 +2,7 @@ export type CommandState =
   | "PENDING"
   | "CLAIMED"
   | "DELIVERED"
+  | "CANCELLED"
   | "TIMED_OUT"
   | "FAILED";
 
@@ -19,7 +20,9 @@ export type CausedBy =
   | "ACK"
   | "LEASE_EXPIRY"
   | "RETRY"
-  | "TIMEOUT";
+  | "TIMEOUT"
+  | "CANCEL"
+  | "REPLACE";
 
 export interface DomainEvent {
   eventId: string;
@@ -46,6 +49,11 @@ export interface CommandSnapshot {
   leaseId?: string;
   leaseExpiresAt?: number;
   deliveredAt?: number;
+  cancelledAt?: number;
+  cancelledBy?: string;
+  cancelReason?: string;
+  supersededByCommandId?: string;
+  supersedesCommandId?: string;
   terminalReason?: string;
   createdAt: number;
   updatedAt: number;
@@ -88,6 +96,24 @@ export interface ExpireInput {
   now: number;
   maxAttempts: number;
   maxAgeMs?: number;
+}
+
+export interface CancelInput {
+  commandId: string;
+  reason: string;
+  requestedBy: string;
+  cancelledAt: number;
+}
+
+export interface ReplaceInput {
+  oldCommandId: string;
+  newCommandId: string;
+  newIdempotencyKey: string;
+  deviceId: string;
+  replacementPayload: CommandPayload;
+  reason: string;
+  requestedBy: string;
+  replacedAt: number;
 }
 
 export interface Decision<T = Record<string, unknown>> {

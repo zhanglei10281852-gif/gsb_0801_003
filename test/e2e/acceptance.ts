@@ -304,6 +304,104 @@ async function main() {
     assert(finalState.body.generation === 2, "final generation must be 2");
     await stopServer(fgServer2);
 
+    console.log("e2e: crash recovery for emergency cancel and replace");
+    const rcPort = port + 3;
+    const rcDb = join(tempDir, "replace-crash.db");
+    const crashSrv = await startServer(rcPort, rcDb, true);
+    const crashCli = new ApiClient(`http://127.0.0.1:${rcPort}`);
+    await waitForHealth(crashCli);
+
+    const oldKey = `replace-crash-old-${Date.now()}`;
+    await crashCli.submit({
+      idempotencyKey: oldKey,
+      deviceId: "crash-device",
+      payload: { type: "SWITCH_RECIPE", params: { recipe: "D" } },
+    });
+    const oldCmdId = (
+      (await crashCli.getByIdempotencyKey(oldKey)).body as { commandId: string }
+    ).commandId;
+    const gwOld = new GatewaySimulator("gw-crash-old", crashCli);
+    const oldLease = await gwOld.pollOnce(300, oldCmdId);
+    assert(oldLease?.generation === 1, "old claim should be generation 1");
+
+    const newKey = `replace-crash-new-${Date.now()}`;
+    await crashCli.armCrashAfterCommit();
+    let replaceCrashed = false;
+    try {
+      await crashCli.replace(oldCmdId, newKey, { type: "SAFE_STOP" });
+    } catch {
+      replaceCrashed = true;
+    }
+    assert(
+      replaceCrashed,
+      "replace connection should be reset after durable commit",
+    );
+    await stopServer(crashSrv);
+
+    const crashSrv2 = await startServer(rcPort, rcDb, false);
+    await waitForHealth(crashCli);
+    const oldAfter = (await crashCli.getCommand(oldCmdId, true)) as unknown as {
+      body: {
+        state: string;
+        supersededByCommandId?: string;
+        events: { type: string }[];
+      };
+    };
+    assert(
+      oldAfter.body.state === "CANCELLED",
+      "old command must remain CANCELLED after restart",
+    );
+    const newId = oldAfter.body.supersededByCommandId!;
+    assert(
+      oldAfter.body.events.some((e) => e.type === "CommandSuperseded"),
+      "supersession event must survive crash",
+    );
+    const newAfter = (await crashCli.getCommand(newId)) as unknown as {
+      body: { state: string; supersedesCommandId?: string };
+    };
+    assert(
+      newAfter.body.supersedesCommandId === oldCmdId,
+      "replacement must link back to old command after restart",
+    );
+
+    const rcStale = await GatewaySimulator.staleGenerationAck(
+      crashCli,
+      gwOld.gatewayId,
+      oldCmdId,
+      oldLease.leaseId,
+      oldLease.generation,
+    );
+    assert(
+      rcStale.status === 409,
+      "old gateway generation must remain fenced after restart+replace",
+    );
+
+    const idempotent = await crashCli.replace(oldCmdId, newKey, {
+      type: "SAFE_STOP",
+    });
+    assert(idempotent.status === 200, "idempotent replace retry must succeed");
+    assert(
+      (idempotent.body as { newCommandId: string }).newCommandId === newId,
+      "replace retry must not create a second replacement",
+    );
+
+    const gwNew = new GatewaySimulator("gw-crash-new", crashCli);
+    const newLease = await gwNew.pollOnce(5000, newId);
+    assert(
+      newLease?.generation === 1,
+      "replacement should be claimed at generation 1",
+    );
+    const newAck = await gwNew.ack(newLease);
+    assert(newAck.status === 200, "replacement ack must succeed after restart");
+    const newFinal = (await crashCli.getCommand(newId)) as unknown as {
+      body: { state: string };
+    };
+    assert(
+      newFinal.body.state === "DELIVERED",
+      "replacement must be DELIVERED",
+    );
+    await stopServer(crashSrv2);
+
     console.log("e2e ALL CHECKS PASSED");
     await stopServer(server);
   } finally {

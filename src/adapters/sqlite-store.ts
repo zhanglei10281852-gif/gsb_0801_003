@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { CommandSnapshot, DomainEvent } from "../domain/types.js";
 import {
+  type AppendItem,
   ConcurrencyError,
   type EventStore,
   type ListEventsFilter,
@@ -42,6 +43,13 @@ function parseSnapshot(row: Record<string, unknown>): CommandSnapshot {
     leaseId: (row.lease_id as string | null) ?? undefined,
     leaseExpiresAt: leaseExpiresAt === null ? undefined : leaseExpiresAt,
     deliveredAt: (row.delivered_at as number | null) ?? undefined,
+    cancelledAt: (row.cancelled_at as number | null) ?? undefined,
+    cancelledBy: (row.cancelled_by as string | null) ?? undefined,
+    cancelReason: (row.cancel_reason as string | null) ?? undefined,
+    supersededByCommandId:
+      (row.superseded_by_command_id as string | null) ?? undefined,
+    supersedesCommandId:
+      (row.supersedes_command_id as string | null) ?? undefined,
     terminalReason: (row.terminal_reason as string | null) ?? undefined,
     createdAt: row.created_at as number,
     updatedAt: row.updated_at as number,
@@ -50,6 +58,13 @@ function parseSnapshot(row: Record<string, unknown>): CommandSnapshot {
 
 export class SqliteEventStore implements EventStore {
   private readonly db: InstanceType<typeof Database>;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private readonly insertEvent: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private readonly upsertCommand: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private readonly selectVersion: any;
 
   constructor(options: SqliteStoreOptions) {
     const path = resolve(options.filePath);
@@ -60,6 +75,43 @@ export class SqliteEventStore implements EventStore {
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("synchronous = FULL");
     this.migrate();
+    this.insertEvent = this.db.prepare(`
+      INSERT INTO events (
+        event_id, command_id, version, event_type, data,
+        caused_by, causation_id, occurred_at, recorded_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    this.upsertCommand = this.db.prepare(`
+      INSERT INTO commands (
+        command_id, idempotency_key, device_id, payload, state, version,
+        attempt, generation, gateway_id, lease_id, lease_expires_at,
+        delivered_at, cancelled_at, cancelled_by, cancel_reason,
+        superseded_by_command_id, supersedes_command_id,
+        terminal_reason, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(command_id) DO UPDATE SET
+        idempotency_key=excluded.idempotency_key,
+        device_id=excluded.device_id,
+        payload=excluded.payload,
+        state=excluded.state,
+        version=excluded.version,
+        attempt=excluded.attempt,
+        generation=excluded.generation,
+        gateway_id=excluded.gateway_id,
+        lease_id=excluded.lease_id,
+        lease_expires_at=excluded.lease_expires_at,
+        delivered_at=excluded.delivered_at,
+        cancelled_at=excluded.cancelled_at,
+        cancelled_by=excluded.cancelled_by,
+        cancel_reason=excluded.cancel_reason,
+        superseded_by_command_id=excluded.superseded_by_command_id,
+        supersedes_command_id=excluded.supersedes_command_id,
+        terminal_reason=excluded.terminal_reason,
+        updated_at=excluded.updated_at
+    `);
+    this.selectVersion = this.db.prepare(
+      "SELECT version FROM commands WHERE command_id = ?",
+    );
   }
 
   private migrate() {
@@ -93,6 +145,11 @@ export class SqliteEventStore implements EventStore {
         lease_id TEXT,
         lease_expires_at INTEGER,
         delivered_at INTEGER,
+        cancelled_at INTEGER,
+        cancelled_by TEXT,
+        cancel_reason TEXT,
+        superseded_by_command_id TEXT,
+        supersedes_command_id TEXT,
         terminal_reason TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -100,15 +157,25 @@ export class SqliteEventStore implements EventStore {
       CREATE INDEX IF NOT EXISTS ix_commands_state ON commands(state);
       CREATE INDEX IF NOT EXISTS ix_commands_lease ON commands(lease_expires_at);
       CREATE INDEX IF NOT EXISTS ix_commands_device ON commands(device_id);
+      CREATE INDEX IF NOT EXISTS ix_commands_supersedes ON commands(supersedes_command_id);
     `);
 
     const cols = this.db.prepare("PRAGMA table_info(commands)").all() as {
       name: string;
     }[];
-    if (!cols.some((c) => c.name === "generation")) {
-      this.db.exec(
-        "ALTER TABLE commands ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
-      );
+    const columnNames = new Set(cols.map((c) => c.name));
+    const additions: Record<string, string> = {
+      generation: "INTEGER NOT NULL DEFAULT 0",
+      cancelled_at: "INTEGER",
+      cancelled_by: "TEXT",
+      cancel_reason: "TEXT",
+      superseded_by_command_id: "TEXT",
+      supersedes_command_id: "TEXT",
+    };
+    for (const [name, def] of Object.entries(additions)) {
+      if (!columnNames.has(name)) {
+        this.db.exec(`ALTER TABLE commands ADD COLUMN ${name} ${def}`);
+      }
     }
   }
 
@@ -119,86 +186,68 @@ export class SqliteEventStore implements EventStore {
     snapshotAfter: CommandSnapshot | undefined,
   ): void {
     if (events.length === 0) return;
-    const insertEvent = this.db.prepare(`
-      INSERT INTO events (
-        event_id, command_id, version, event_type, data,
-        caused_by, causation_id, occurred_at, recorded_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const upsertCommand = this.db.prepare(`
-      INSERT INTO commands (
-        command_id, idempotency_key, device_id, payload, state, version,
-        attempt, generation, gateway_id, lease_id, lease_expires_at,
-        delivered_at, terminal_reason, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(command_id) DO UPDATE SET
-        idempotency_key=excluded.idempotency_key,
-        device_id=excluded.device_id,
-        payload=excluded.payload,
-        state=excluded.state,
-        version=excluded.version,
-        attempt=excluded.attempt,
-        generation=excluded.generation,
-        gateway_id=excluded.gateway_id,
-        lease_id=excluded.lease_id,
-        lease_expires_at=excluded.lease_expires_at,
-        delivered_at=excluded.delivered_at,
-        terminal_reason=excluded.terminal_reason,
-        updated_at=excluded.updated_at
-    `);
+    this.applyAppend([{ commandId, expectedVersion, events, snapshotAfter }]);
+  }
 
+  appendBatch(items: AppendItem[]): void {
+    if (items.length === 0) return;
+    this.applyAppend(items);
+  }
+
+  private writeSnapshot(snapshotAfter: CommandSnapshot): void {
+    this.upsertCommand.run(
+      snapshotAfter.commandId,
+      snapshotAfter.idempotencyKey,
+      snapshotAfter.deviceId,
+      JSON.stringify(snapshotAfter.payload),
+      snapshotAfter.state,
+      snapshotAfter.version,
+      snapshotAfter.attempt,
+      snapshotAfter.generation,
+      snapshotAfter.gatewayId ?? null,
+      snapshotAfter.leaseId ?? null,
+      snapshotAfter.leaseExpiresAt ?? null,
+      snapshotAfter.deliveredAt ?? null,
+      snapshotAfter.cancelledAt ?? null,
+      snapshotAfter.cancelledBy ?? null,
+      snapshotAfter.cancelReason ?? null,
+      snapshotAfter.supersededByCommandId ?? null,
+      snapshotAfter.supersedesCommandId ?? null,
+      snapshotAfter.terminalReason ?? null,
+      snapshotAfter.createdAt,
+      snapshotAfter.updatedAt,
+    );
+  }
+
+  private applyAppend(items: AppendItem[]): void {
     const tx = this.db.transaction(() => {
-      if (expectedVersion === 0) {
-        const existing = this.db
-          .prepare("SELECT version FROM commands WHERE command_id = ?")
-          .get(commandId) as { version: number } | undefined;
-        if (existing)
-          throw new ConcurrencyError(commandId, 0, existing.version);
-      } else {
-        const current = this.db
-          .prepare("SELECT version FROM commands WHERE command_id = ?")
-          .get(commandId) as { version: number } | undefined;
-        if (!current || current.version !== expectedVersion) {
+      for (const item of items) {
+        if (item.events.length === 0) continue;
+        const current = this.selectVersion.get(item.commandId) as
+          | { version: number }
+          | undefined;
+        const actual = current?.version ?? 0;
+        if (actual !== item.expectedVersion) {
           throw new ConcurrencyError(
-            commandId,
-            expectedVersion,
-            current?.version ?? -1,
+            item.commandId,
+            item.expectedVersion,
+            actual,
           );
         }
-      }
-
-      for (const e of events) {
-        insertEvent.run(
-          e.eventId,
-          e.commandId,
-          e.version,
-          e.type,
-          JSON.stringify(e.data),
-          e.causedBy,
-          e.causationId ?? null,
-          e.occurredAt,
-          e.recordedAt,
-        );
-      }
-
-      if (snapshotAfter) {
-        upsertCommand.run(
-          snapshotAfter.commandId,
-          snapshotAfter.idempotencyKey,
-          snapshotAfter.deviceId,
-          JSON.stringify(snapshotAfter.payload),
-          snapshotAfter.state,
-          snapshotAfter.version,
-          snapshotAfter.attempt,
-          snapshotAfter.generation,
-          snapshotAfter.gatewayId ?? null,
-          snapshotAfter.leaseId ?? null,
-          snapshotAfter.leaseExpiresAt ?? null,
-          snapshotAfter.deliveredAt ?? null,
-          snapshotAfter.terminalReason ?? null,
-          snapshotAfter.createdAt,
-          snapshotAfter.updatedAt,
-        );
+        for (const e of item.events) {
+          this.insertEvent.run(
+            e.eventId,
+            e.commandId,
+            e.version,
+            e.type,
+            JSON.stringify(e.data),
+            e.causedBy,
+            e.causationId ?? null,
+            e.occurredAt,
+            e.recordedAt,
+          );
+        }
+        if (item.snapshotAfter) this.writeSnapshot(item.snapshotAfter);
       }
     });
     tx();
