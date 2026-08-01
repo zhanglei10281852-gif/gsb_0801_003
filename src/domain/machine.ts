@@ -5,13 +5,15 @@
  * 输出:需要写入的状态变更 + 因果事件 + 给调用方的回复
  *
  * 不触碰 HTTP、Socket、SQLite,也不读真实时钟——故障时序(崩溃、超时、
- * 迟到消息)可以在测试中通过注入时钟与消息顺序被确定性地复现。
+ * 网络分区、迟到消息)可以在测试中通过注入时钟与消息顺序被确定性地复现。
  *
  * 核心不变量:
- * 1. executionToken 在指令创建后永不变化,重试/重新领取沿用同一执行身份。
+ * 1. executionToken 在指令创建后永不变化:重试、跨网关、跨代际重投都沿用同一执行身份。
  * 2. 只有"被持久化且被应用"的设备确认,才能把指令推进到 SUCCEEDED。
  * 3. 终态(SUCCEEDED/FAILED)不可逆:迟到的确认/续约不能悄悄复活指令。
- * 4. 每次状态变化都附带因果事件。
+ * 4. fencing:只有当前属主网关、持当前代际、且所有权租约未过期,才能
+ *    领取/续约/推进确认;其余一律拒绝,且不得改变领域状态。
+ * 5. 每次状态变化都附带因果事件。
  */
 
 import {
@@ -20,12 +22,14 @@ import {
   Command,
   DomainEvent,
   EventType,
+  Ownership,
 } from './types';
 
 export interface MachineConfig {
   leaseTtlMs: number;
   maxAttempts: number;
   retryBackoffMs: number;
+  ownershipLeaseTtlMs: number;
 }
 
 /** 决策上下文:全部外部性都从这里注入 */
@@ -41,6 +45,7 @@ export interface Writes {
   command?: Command;
   attempt?: Attempt;
   ack?: AckRecord;
+  ownership?: Ownership;
   events: DomainEvent[];
 }
 
@@ -51,12 +56,155 @@ export interface Decision<TReply> {
 
 function ev(
   ctx: Ctx,
-  commandId: string,
+  commandId: string | null,
+  lineId: string | null,
   attemptId: string | null,
   type: EventType,
   data: Record<string, unknown>,
 ): DomainEvent {
-  return { commandId, attemptId, type, data, causedBy: ctx.causedBy, at: ctx.now };
+  return { commandId, lineId, attemptId, type, data, causedBy: ctx.causedBy, at: ctx.now };
+}
+
+function cmdEv(
+  ctx: Ctx,
+  command: Command,
+  attemptId: string | null,
+  type: EventType,
+  data: Record<string, unknown>,
+): DomainEvent {
+  return ev(ctx, command.id, command.lineId, attemptId, type, data);
+}
+
+function lineEv(
+  ctx: Ctx,
+  lineId: string,
+  type: EventType,
+  data: Record<string, unknown>,
+): DomainEvent {
+  return ev(ctx, null, lineId, null, type, data);
+}
+
+// ---------------------------------------------------------------- ownership
+
+export type FenceStatus =
+  | 'ok'
+  | 'no_ownership'              // 产线尚无属主(未心跳)
+  | 'not_owner'                 // 当前属主是别的网关
+  | 'stale_generation'          // 是属主但代际已旧(被接管过)
+  | 'ownership_lease_expired';  // 所有权租约已过期,必须重新心跳
+
+/**
+ * fencing 判定:网关是否能以给定代际操作该产线。
+ * 注意:即使仍是属主,所有权租约过期后同样被 fencing——它可能已被分区,
+ * 必须先心跳重新获取(代际 +1)才能继续操作。
+ */
+export function fenceStatus(
+  ownership: Ownership | null,
+  gatewayId: string,
+  generation: number,
+  now: number,
+): FenceStatus {
+  if (!ownership) return 'no_ownership';
+  if (ownership.ownerGatewayId !== gatewayId) return 'not_owner';
+  if (ownership.generation !== generation) return 'stale_generation';
+  if (now > ownership.leaseExpiresAt) return 'ownership_lease_expired';
+  return 'ok';
+}
+
+export interface HeartbeatReply {
+  acquired: boolean;
+  lineId: string;
+  gatewayId: string;
+  /** 当前代际(无论本次是否获得所有权) */
+  generation: number;
+  leaseExpiresAt: number | null;
+  owner: string;
+  /** 本次心跳发生接管时,被取代的前属主(供服务层中止其在途投递) */
+  tookOverFrom: string | null;
+}
+
+/**
+ * 网关心跳:获取/续约产线所有权。
+ * - 无所有权 → 获得,代际 1
+ * - 本人持有且未过期 → 续约,代际不变
+ * - 租约已过期(无论谁持有)→ 接管,代际 +1;旧代际自此被 fencing
+ * - 他人持有且未过期 → 拒绝(争抢留痕),调用方据此知道自己不是属主
+ */
+export function decideHeartbeat(
+  ownership: Ownership | null,
+  gatewayId: string,
+  lineId: string,
+  ctx: Ctx,
+): Decision<HeartbeatReply> {
+  const leaseExpiresAt = ctx.now + ctx.config.ownershipLeaseTtlMs;
+
+  if (!ownership) {
+    const next: Ownership = { lineId, ownerGatewayId: gatewayId, generation: 1, leaseExpiresAt, updatedAt: ctx.now };
+    return {
+      writes: {
+        ownership: next,
+        events: [lineEv(ctx, lineId, 'OWNERSHIP_ACQUIRED', { gatewayId, generation: 1, leaseExpiresAt })],
+      },
+      reply: { acquired: true, lineId, gatewayId, generation: 1, leaseExpiresAt, owner: gatewayId, tookOverFrom: null },
+    };
+  }
+
+  if (ctx.now > ownership.leaseExpiresAt) {
+    const next: Ownership = {
+      lineId,
+      ownerGatewayId: gatewayId,
+      generation: ownership.generation + 1,
+      leaseExpiresAt,
+      updatedAt: ctx.now,
+    };
+    return {
+      writes: {
+        ownership: next,
+        events: [
+          lineEv(ctx, lineId, 'OWNERSHIP_TAKEN_OVER', {
+            previousGateway: ownership.ownerGatewayId,
+            previousGeneration: ownership.generation,
+            gatewayId,
+            generation: next.generation,
+            reason: 'ownership_lease_expired',
+          }),
+        ],
+      },
+      reply: { acquired: true, lineId, gatewayId, generation: next.generation, leaseExpiresAt, owner: gatewayId, tookOverFrom: ownership.ownerGatewayId },
+    };
+  }
+
+  if (ownership.ownerGatewayId === gatewayId) {
+    const next: Ownership = { ...ownership, leaseExpiresAt, updatedAt: ctx.now };
+    return {
+      writes: {
+        ownership: next,
+        events: [lineEv(ctx, lineId, 'OWNERSHIP_RENEWED', { gatewayId, generation: next.generation, leaseExpiresAt })],
+      },
+      reply: { acquired: true, lineId, gatewayId, generation: next.generation, leaseExpiresAt, owner: gatewayId, tookOverFrom: null },
+    };
+  }
+
+  return {
+    writes: {
+      events: [
+        lineEv(ctx, lineId, 'OWNERSHIP_HEARTBEAT_REJECTED', {
+          owner: ownership.ownerGatewayId,
+          generation: ownership.generation,
+          contender: gatewayId,
+        }),
+      ],
+    },
+    reply: {
+      acquired: false,
+      lineId,
+      gatewayId,
+      generation: ownership.generation,
+      leaseExpiresAt: ownership.leaseExpiresAt,
+      owner: ownership.ownerGatewayId,
+      tookOverFrom: null,
+    },
+  };
 }
 
 // ---------------------------------------------------------------- submit
@@ -65,11 +213,13 @@ export interface SubmitRequest {
   idempotencyKey: string;
   action: string;
   params: unknown;
+  lineId?: string;
 }
 
 export interface SubmitReply {
   commandId: string;
   idempotencyKey: string;
+  lineId: string;
   status: Command['status'];
   executionToken: string;
   deduped: boolean;
@@ -87,15 +237,12 @@ export function decideSubmit(
   if (existing) {
     return {
       writes: {
-        events: [
-          ev(ctx, existing.id, null, 'SUBMISSION_DEDUPED', {
-            idempotencyKey: req.idempotencyKey,
-          }),
-        ],
+        events: [cmdEv(ctx, existing, null, 'SUBMISSION_DEDUPED', { idempotencyKey: req.idempotencyKey })],
       },
       reply: {
         commandId: existing.id,
         idempotencyKey: existing.idempotencyKey,
+        lineId: existing.lineId,
         status: existing.status,
         executionToken: existing.executionToken,
         deduped: true,
@@ -103,9 +250,11 @@ export function decideSubmit(
     };
   }
   const id = ctx.newId();
+  const lineId = req.lineId ?? 'default';
   const command: Command = {
     id,
     idempotencyKey: req.idempotencyKey,
+    lineId,
     action: req.action,
     params: req.params ?? null,
     status: 'PENDING',
@@ -119,29 +268,47 @@ export function decideSubmit(
   return {
     writes: {
       command,
-      events: [
-        ev(ctx, id, null, 'COMMAND_ACCEPTED', {
-          idempotencyKey: req.idempotencyKey,
-          action: req.action,
-        }),
-      ],
+      events: [cmdEv(ctx, command, null, 'COMMAND_ACCEPTED', { idempotencyKey: req.idempotencyKey, action: req.action, lineId })],
     },
-    reply: {
-      commandId: id,
-      idempotencyKey: req.idempotencyKey,
-      status: 'PENDING',
-      executionToken: command.executionToken,
-      deduped: false,
-    },
+    reply: { commandId: id, idempotencyKey: req.idempotencyKey, lineId, status: 'PENDING', executionToken: command.executionToken, deduped: false },
   };
 }
 
-// ---------------------------------------------------------------- expire
+// ---------------------------------------------------------------- expire / abort
 
-export interface ExpireWrites {
+export interface TransitionWrites {
   command: Command;
   attempt: Attempt;
   events: DomainEvent[];
+}
+
+/** 过期/中止后的公共收尾:重派(沿用执行身份)或终结 */
+function rescheduleOrFail(
+  command: Command,
+  attempt: Attempt,
+  ctx: Ctx,
+  events: DomainEvent[],
+  opts: { backoff: boolean },
+): TransitionWrites {
+  const doneAttempt: Attempt = { ...attempt, status: 'EXPIRED' };
+  if (command.attemptCount >= ctx.config.maxAttempts) {
+    const next: Command = { ...command, status: 'FAILED', activeAttemptId: null, updatedAt: ctx.now };
+    events.push(
+      cmdEv(ctx, command, attempt.id, 'COMMAND_FAILED', { reason: 'attempts_exhausted', attempts: command.attemptCount }),
+    );
+    return { command: next, attempt: doneAttempt, events };
+  }
+  // 接管中止不退避(应立即由新属主重投);普通过期按线性退避
+  const notBefore = opts.backoff ? ctx.now + ctx.config.retryBackoffMs * command.attemptCount : ctx.now;
+  const next: Command = {
+    ...command,
+    status: 'PENDING',
+    activeAttemptId: null,
+    nextAttemptNotBefore: notBefore,
+    updatedAt: ctx.now,
+  };
+  events.push(cmdEv(ctx, command, attempt.id, 'RETRY_SCHEDULED', { attemptNo: attempt.attemptNo + 1, notBefore }));
+  return { command: next, attempt: doneAttempt, events };
 }
 
 /**
@@ -155,59 +322,54 @@ export function expiryDecision(
   command: Command,
   attempt: Attempt,
   ctx: Ctx,
-): ExpireWrites | null {
+): TransitionWrites | null {
   if (command.status !== 'DISPATCHED') return null;
   if (attempt.status !== 'ACTIVE') return null;
   if (ctx.now <= attempt.leaseExpiresAt) return null;
 
-  const expiredAttempt: Attempt = { ...attempt, status: 'EXPIRED' };
   const events: DomainEvent[] = [
-    ev(ctx, command.id, attempt.id, 'LEASE_EXPIRED', {
+    cmdEv(ctx, command, attempt.id, 'LEASE_EXPIRED', {
       attemptNo: attempt.attemptNo,
       gatewayId: attempt.gatewayId,
+      generation: attempt.generation,
       leaseExpiredAt: attempt.leaseExpiresAt,
     }),
   ];
+  return rescheduleOrFail(command, attempt, ctx, events, { backoff: true });
+}
 
-  let next: Command;
-  if (command.attemptCount >= ctx.config.maxAttempts) {
-    next = {
-      ...command,
-      status: 'FAILED',
-      activeAttemptId: null,
-      updatedAt: ctx.now,
-    };
-    events.push(
-      ev(ctx, command.id, attempt.id, 'COMMAND_FAILED', {
-        reason: 'attempts_exhausted',
-        attempts: command.attemptCount,
-      }),
-    );
-  } else {
-    const notBefore = ctx.now + ctx.config.retryBackoffMs * command.attemptCount;
-    next = {
-      ...command,
-      status: 'PENDING',
-      activeAttemptId: null,
-      nextAttemptNotBefore: notBefore,
-      updatedAt: ctx.now,
-    };
-    events.push(
-      ev(ctx, command.id, attempt.id, 'RETRY_SCHEDULED', {
-        attemptNo: attempt.attemptNo + 1,
-        notBefore,
-      }),
-    );
-  }
-  return { command: next, attempt: expiredAttempt, events };
+/**
+ * 接管中止:所有权易主时,前属主仍在飞的投递立即作废(不等其自然过期),
+ * 指令立刻回到 PENDING 供新属主重投。旧属主后续对该租约的任何操作都会被 fencing。
+ */
+export function abortDecision(
+  command: Command,
+  attempt: Attempt,
+  ctx: Ctx,
+  reason: string,
+): TransitionWrites | null {
+  if (command.status !== 'DISPATCHED') return null;
+  if (attempt.status !== 'ACTIVE') return null;
+
+  const events: DomainEvent[] = [
+    cmdEv(ctx, command, attempt.id, 'ATTEMPT_ABORTED', {
+      reason,
+      attemptNo: attempt.attemptNo,
+      gatewayId: attempt.gatewayId,
+      generation: attempt.generation,
+    }),
+  ];
+  return rescheduleOrFail(command, attempt, ctx, events, { backoff: false });
 }
 
 // ---------------------------------------------------------------- claim
 
 export interface ClaimTask {
   commandId: string;
+  lineId: string;
   executionToken: string;
   attemptNo: number;
+  generation: number;
   leaseId: string;
   leaseExpiresAt: number;
   action: string;
@@ -215,12 +377,13 @@ export interface ClaimTask {
 }
 
 /**
- * 领取任务:仅限 PENDING 且到达可领取时间的指令。
- * 新尝试 attemptNo 递增,但 executionToken 沿用指令创建时的身份。
+ * 领取任务(fencing 校验由服务层在调用前完成)。
+ * 新尝试 attemptNo 递增,记录当前所有权代际;executionToken 沿用指令创建时的身份。
  */
 export function decideClaim(
   command: Command,
   gatewayId: string,
+  generation: number,
   ctx: Ctx,
 ): Decision<ClaimTask> {
   const attemptNo = command.attemptCount + 1;
@@ -231,6 +394,7 @@ export function decideClaim(
     commandId: command.id,
     attemptNo,
     gatewayId,
+    generation,
     leaseId,
     status: 'ACTIVE',
     leasedAt: ctx.now,
@@ -249,9 +413,10 @@ export function decideClaim(
       command: next,
       attempt,
       events: [
-        ev(ctx, command.id, attemptId, 'DELIVERY_STARTED', {
+        cmdEv(ctx, command, attemptId, 'DELIVERY_STARTED', {
           attemptNo,
           gatewayId,
+          generation,
           executionToken: command.executionToken,
           leaseExpiresAt: attempt.leaseExpiresAt,
         }),
@@ -259,8 +424,10 @@ export function decideClaim(
     },
     reply: {
       commandId: command.id,
+      lineId: command.lineId,
       executionToken: command.executionToken,
       attemptNo,
+      generation,
       leaseId,
       leaseExpiresAt: attempt.leaseExpiresAt,
       action: command.action,
@@ -278,8 +445,21 @@ export type RenewReply =
 export function decideRenew(
   command: Command,
   attempt: Attempt,
+  generation: number,
+  ownership: Ownership | null,
   ctx: Ctx,
 ): Decision<RenewReply> {
+  // fencing 优先:旧代际/非属主/所有权过期,一律拒绝且不改状态
+  const fence = fenceStatus(ownership, attempt.gatewayId, generation, ctx.now);
+  if (fence !== 'ok') {
+    return {
+      writes: {
+        events: [cmdEv(ctx, command, attempt.id, 'RENEW_FENCED', { reason: fence, gatewayId: attempt.gatewayId, generation })],
+      },
+      reply: { ok: false, reason: `fenced_${fence}` },
+    };
+  }
+
   // 时钟已越过租约:先按过期结算(与巡检器路径完全一致),再拒绝本次续约。
   const expired = expiryDecision(command, attempt, ctx);
   if (expired) {
@@ -289,7 +469,7 @@ export function decideRenew(
         attempt: expired.attempt,
         events: [
           ...expired.events,
-          ev(ctx, command.id, attempt.id, 'RENEW_REJECTED', { reason: 'lease_expired' }),
+          cmdEv(ctx, command, attempt.id, 'RENEW_REJECTED', { reason: 'lease_expired' }),
         ],
       },
       reply: { ok: false, reason: 'lease_expired' },
@@ -299,7 +479,7 @@ export function decideRenew(
     return {
       writes: {
         events: [
-          ev(ctx, command.id, attempt.id, 'RENEW_REJECTED', {
+          cmdEv(ctx, command, attempt.id, 'RENEW_REJECTED', {
             reason: 'attempt_not_active',
             commandStatus: command.status,
             attemptStatus: attempt.status,
@@ -318,8 +498,9 @@ export function decideRenew(
     writes: {
       attempt: renewed,
       events: [
-        ev(ctx, command.id, attempt.id, 'LEASE_RENEWED', {
+        cmdEv(ctx, command, attempt.id, 'LEASE_RENEWED', {
           attemptNo: attempt.attemptNo,
+          generation: attempt.generation,
           leaseExpiresAt: renewed.leaseExpiresAt,
           renewedCount: renewed.renewedCount,
         }),
@@ -334,6 +515,8 @@ export function decideRenew(
 export interface AckRequest {
   ackId: string;
   result: unknown;
+  /** 网关所持所有权代际 */
+  generation: number;
 }
 
 export interface AckReply {
@@ -348,10 +531,12 @@ function ignoredAck(
   attempt: Attempt,
   req: AckRequest,
   reason: string,
+  eventType: 'DEVICE_ACK_IGNORED' | 'ACK_FENCED',
   ctx: Ctx,
   extraEvents: DomainEvent[],
   extraWrites: Partial<Writes>,
 ): Decision<AckReply> {
+  // 被 fencing 的确认同样持久化留痕(设备可能真的执行了),但绝不推进状态
   const ack: AckRecord = {
     id: req.ackId,
     commandId: command.id,
@@ -367,11 +552,7 @@ function ignoredAck(
       ack,
       events: [
         ...extraEvents,
-        ev(ctx, command.id, attempt.id, 'DEVICE_ACK_IGNORED', {
-          ackId: req.ackId,
-          reason,
-          attemptNo: attempt.attemptNo,
-        }),
+        cmdEv(ctx, command, attempt.id, eventType, { ackId: req.ackId, reason, attemptNo: attempt.attemptNo, generation: req.generation }),
       ],
     },
     reply: { outcome: 'ignored', reason, duplicate: false, commandStatus: command.status },
@@ -381,15 +562,17 @@ function ignoredAck(
 /**
  * 设备确认。判定顺序保证不变量:
  * 1. ackId 已存在 → 幂等重放,返回首次记录的结果,绝不二次生效。
- * 2. 指令已终态 → 持久化但忽略,迟到消息不能复活指令。
- * 3. 尝试已非 ACTIVE(被取代/已过期)→ 持久化但忽略。
- * 4. 时钟已越过租约 → 先按过期结算,再忽略(与巡检器语义一致)。
- * 5. 全部通过 → 持久化确认并把指令推进到 SUCCEEDED。
+ * 2. fencing:非属主/旧代际/所有权过期 → 持久化留痕但忽略,不得推进状态。
+ * 3. 指令已终态 → 持久化但忽略,迟到消息不能复活指令。
+ * 4. 尝试已非 ACTIVE(被取代/已过期/被中止)→ 持久化但忽略。
+ * 5. 时钟已越过租约 → 先按过期结算,再忽略(与巡检器语义一致)。
+ * 6. 全部通过 → 持久化确认并把指令推进到 SUCCEEDED。
  */
 export function decideAck(
   command: Command,
   attempt: Attempt,
   req: AckRequest,
+  ownership: Ownership | null,
   existingAck: AckRecord | null,
   ctx: Ctx,
 ): Decision<AckReply> {
@@ -397,7 +580,7 @@ export function decideAck(
     return {
       writes: {
         events: [
-          ev(ctx, command.id, attempt.id, 'DEVICE_ACK_DUPLICATE', {
+          cmdEv(ctx, command, attempt.id, 'DEVICE_ACK_DUPLICATE', {
             ackId: req.ackId,
             originalApplied: existingAck.applied,
             originalIgnoreReason: existingAck.ignoreReason,
@@ -413,19 +596,24 @@ export function decideAck(
     };
   }
 
+  const fence = fenceStatus(ownership, attempt.gatewayId, req.generation, ctx.now);
+  if (fence !== 'ok') {
+    return ignoredAck(command, attempt, req, `fenced_${fence}`, 'ACK_FENCED', ctx, [], {});
+  }
+
   if (command.status === 'SUCCEEDED') {
-    return ignoredAck(command, attempt, req, 'command_already_succeeded', ctx, [], {});
+    return ignoredAck(command, attempt, req, 'command_already_succeeded', 'DEVICE_ACK_IGNORED', ctx, [], {});
   }
   if (command.status === 'FAILED') {
-    return ignoredAck(command, attempt, req, 'command_terminal', ctx, [], {});
+    return ignoredAck(command, attempt, req, 'command_terminal', 'DEVICE_ACK_IGNORED', ctx, [], {});
   }
   if (attempt.status !== 'ACTIVE') {
-    return ignoredAck(command, attempt, req, 'attempt_not_active', ctx, [], {});
+    return ignoredAck(command, attempt, req, 'attempt_not_active', 'DEVICE_ACK_IGNORED', ctx, [], {});
   }
 
   const expired = expiryDecision(command, attempt, ctx);
   if (expired) {
-    return ignoredAck(expired.command, expired.attempt, req, 'lease_expired', ctx, expired.events, {
+    return ignoredAck(expired.command, expired.attempt, req, 'lease_expired', 'DEVICE_ACK_IGNORED', ctx, expired.events, {
       command: expired.command,
       attempt: expired.attempt,
     });
@@ -441,16 +629,8 @@ export function decideAck(
     receivedAt: ctx.now,
   };
   const ackedAttempt: Attempt = { ...attempt, status: 'ACKED' };
-  const succeeded: Command = {
-    ...command,
-    status: 'SUCCEEDED',
-    activeAttemptId: null,
-    updatedAt: ctx.now,
-  };
-  const ackEvent = ev(ctx, command.id, attempt.id, 'DEVICE_ACK_APPLIED', {
-    ackId: req.ackId,
-    attemptNo: attempt.attemptNo,
-  });
+  const succeeded: Command = { ...command, status: 'SUCCEEDED', activeAttemptId: null, updatedAt: ctx.now };
+  const ackEvent = cmdEv(ctx, command, attempt.id, 'DEVICE_ACK_APPLIED', { ackId: req.ackId, attemptNo: attempt.attemptNo, generation: req.generation });
   return {
     writes: {
       command: succeeded,
@@ -459,7 +639,7 @@ export function decideAck(
       events: [
         ackEvent,
         // COMMAND_SUCCEEDED 由已持久化的确认事件因果触发
-        { ...ev(ctx, command.id, attempt.id, 'COMMAND_SUCCEEDED', { ackId: req.ackId }), causedBy: `event:${ackEvent.type}:${req.ackId}` },
+        { ...cmdEv(ctx, command, attempt.id, 'COMMAND_SUCCEEDED', { ackId: req.ackId }), causedBy: `event:${ackEvent.type}:${req.ackId}` },
       ],
     },
     reply: { outcome: 'applied', reason: null, duplicate: false, commandStatus: 'SUCCEEDED' },

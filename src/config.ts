@@ -20,6 +20,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     leaseTtlMs: int(env.LEASE_TTL_MS, 15_000),
     maxAttempts: int(env.MAX_ATTEMPTS, 5),
     retryBackoffMs: int(env.RETRY_BACKOFF_MS, 2_000),
+    ownershipLeaseTtlMs: int(env.OWNERSHIP_LEASE_TTL_MS, 10_000),
     reaperIntervalMs: int(env.REAPER_INTERVAL_MS, 1_000),
     crashAfterSubmitCommit: env.CRASH_AFTER_SUBMIT_COMMIT === '1',
   };

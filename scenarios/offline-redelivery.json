@@ -1,22 +1,27 @@
 {
   "steps": [
-    { "op": "log", "message": "示例:断网重派 + 迟到/重复确认(默认服务参数 LEASE_TTL_MS=15000)" },
-    { "op": "submit", "as": "s1", "key": "demo-001", "action": "calibrate", "params": { "axis": "y" } },
-    { "op": "submit", "as": "s2", "key": "demo-001", "action": "calibrate", "params": { "axis": "y" }, "expectDeduped": true, "expectSameCommandAs": "s1" },
-    { "op": "claim", "gateway": "gw-a", "as": "d1", "expectCommandKey": "s1", "expectAttemptNo": 1 },
-    { "op": "log", "message": "gw-a 断网:不续约也不确认,等待租约过期(15s)" },
-    { "op": "sleep", "ms": 16000 },
-    { "op": "claim", "gateway": "gw-b", "as": "d2", "expectAttemptNo": 2, "expectExecutionTokenOf": "d1" },
+    { "op": "log", "message": "示例:双网关争抢 + 断网接管 + 旧代际 fencing(默认服务参数 LEASE_TTL_MS=15000, OWNERSHIP_LEASE_TTL_MS=10000)" },
+    { "op": "submit", "as": "s1", "key": "demo-001", "action": "calibrate", "params": { "axis": "y" }, "line": "line-1" },
+    { "op": "submit", "as": "s2", "key": "demo-001", "action": "calibrate", "params": { "axis": "y" }, "line": "line-1", "expectDeduped": true, "expectSameCommandAs": "s1" },
+    { "op": "heartbeat", "gateway": "gw-a", "line": "line-1", "expect": "acquired", "expectGeneration": 1 },
+    { "op": "heartbeat", "gateway": "gw-b", "line": "line-1", "expect": "rejected" },
+    { "op": "claim", "gateway": "gw-a", "line": "line-1", "as": "d1", "expectCommandKey": "s1", "expectAttemptNo": 1 },
+    { "op": "log", "message": "gw-a 断网:不心跳、不续约、不确认,等待所有权到期(10s)" },
+    { "op": "sleep", "ms": 11000 },
+    { "op": "heartbeat", "gateway": "gw-b", "line": "line-1", "expect": "acquired", "expectGeneration": 2 },
+    { "op": "claim", "gateway": "gw-a", "line": "line-1", "generation": 1, "expect": "fenced" },
+    { "op": "claim", "gateway": "gw-b", "line": "line-1", "as": "d2", "expectAttemptNo": 2, "expectGeneration": 2, "expectExecutionTokenOf": "d1" },
     { "op": "renew", "delivery": "d2", "expect": "ok" },
-    { "op": "ack", "delivery": "d1", "ackId": "dev-late-1", "expect": "ignored" },
+    { "op": "ack", "delivery": "d1", "generation": 1, "ackId": "dev-late-1", "expect": "fenced" },
     { "op": "ack", "delivery": "d2", "ackId": "dev-ok-1", "expect": "applied" },
     { "op": "ack", "delivery": "d2", "ackId": "dev-ok-1", "expect": "duplicate" },
     { "op": "assertStatus", "key": "demo-001", "status": "SUCCEEDED" },
+    { "op": "assertOwnership", "line": "line-1", "owner": "gw-b", "generation": 2 },
     {
-      "op": "assertEvents",
-      "key": "demo-001",
-      "includes": ["COMMAND_ACCEPTED", "DELIVERY_STARTED", "LEASE_EXPIRED", "RETRY_SCHEDULED", "DELIVERY_STARTED", "LEASE_RENEWED", "DEVICE_ACK_IGNORED", "DEVICE_ACK_APPLIED", "COMMAND_SUCCEEDED", "DEVICE_ACK_DUPLICATE"],
-      "countOf": { "COMMAND_ACCEPTED": 1, "COMMAND_SUCCEEDED": 1 }
+      "op": "assertLineEvents",
+      "line": "line-1",
+      "includes": ["OWNERSHIP_ACQUIRED", "OWNERSHIP_HEARTBEAT_REJECTED", "OWNERSHIP_TAKEN_OVER", "CLAIM_FENCED", "ACK_FENCED", "DEVICE_ACK_APPLIED", "COMMAND_SUCCEEDED"],
+      "countOf": { "COMMAND_SUCCEEDED": 1, "OWNERSHIP_TAKEN_OVER": 1 }
     }
   ]
 }

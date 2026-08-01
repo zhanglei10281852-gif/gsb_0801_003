@@ -2,18 +2,24 @@
  * 场景脚本运行器:按 JSON 场景逐步驱动模拟网关/设备,并校验期望。
  *
  * 支持的操作(op):
- *  - log           { message }                                    打印说明
- *  - submit        { as, key, action, params, expectDeduped, expectSameCommandAs }
- *  - claim         { gateway, as, expectEmpty, expectCommandKey, expectAttemptNo, expectExecutionTokenOf }
- *  - renew         { gateway(默认取投递时的网关), delivery, expect: 'ok'|'rejected' }
- *  - ack           { delivery, ackId, result, expect: 'applied'|'ignored'|'duplicate'|'rejected' }
- *  - sleep         { ms }
- *  - assertStatus  { key|command, status }
- *  - assertEvents  { key|command, includes: [...按顺序包含...], countOf: {TYPE: n} }
- *  - waitStatus    { key|command, status, timeoutMs }             轮询直到状态出现
+ *  - log             { message }
+ *  - submit          { as, key, action, params, line, expectDeduped, expectSameCommandAs }
+ *  - heartbeat       { gateway, line, expect: 'acquired'|'rejected', expectGeneration }
+ *  - claim           { gateway, line, as, generation?, expect: 'tasks'|'empty'|'fenced',
+ *                      expectCommandKey, expectAttemptNo, expectExecutionTokenOf, expectGeneration }
+ *  - renew           { delivery, gateway?, generation?, expect: 'ok'|'rejected'|'fenced' }
+ *  - ack             { delivery, generation?, ackId, result,
+ *                      expect: 'applied'|'ignored'|'duplicate'|'rejected'|'fenced' }
+ *  - sleep           { ms }
+ *  - assertStatus    { key|command, status }
+ *  - assertEvents    { key|command, includes: [...按顺序包含...], countOf: {TYPE: n} }
+ *  - assertLineEvents{ line, includes: [...], countOf: {TYPE: n} }   产线维度因果断言
+ *  - assertOwnership { line, owner, generation }
+ *  - waitStatus      { key|command, status, timeoutMs }
  *
- * 断网复现方式:领取后不再 renew/ack(或 sleep 超过租约),服务侧租约到期即视同失联。
- * 重复提交:两次 submit 使用相同 key。乱序/重复确认:任意顺序多次 ack。
+ * generation 缺省时使用该网关最近一次心跳获得的代际;显式给一个旧数字即可
+ * 复现"网络分区期间旧网关仍在发送"。
+ * 断网复现:领取后不再 heartbeat/renew/ack(或 sleep 超过租约)。
  */
 import { DispatchClient } from './client';
 
@@ -35,13 +41,24 @@ interface Submission {
 
 interface Delivery {
   gateway: string;
+  lineId: string;
   commandId: string;
   executionToken: string;
   attemptNo: number;
+  generation: number;
   leaseId: string;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** 检查 includes 是否为 types 的保序子序列 */
+function isSubsequence(types: string[], includes: string[]): boolean {
+  let idx = 0;
+  for (const t of types) {
+    if (idx < includes.length && t === includes[idx]) idx++;
+  }
+  return idx === includes.length;
+}
 
 export async function runScenario(
   client: DispatchClient,
@@ -50,6 +67,8 @@ export async function runScenario(
 ): Promise<ScenarioResult> {
   const submissions = new Map<string, Submission>();
   const deliveries = new Map<string, Delivery>();
+  /** 每个网关最近一次心跳获得的代际 */
+  const generations = new Map<string, number>();
   const result: ScenarioResult = { passed: 0, failed: 0, failures: [] };
 
   const log = (msg: string) => {
@@ -71,6 +90,33 @@ export async function runScenario(
     const r = await client.getCommand(idOrKey).catch(() => null);
     return r && r.status === 200 ? r.body.id : null;
   };
+  const genOf = (step: Step, gateway: string): number =>
+    step.generation !== undefined ? Number(step.generation) : generations.get(gateway) ?? -1;
+
+  const assertEventView = async (
+    label: string,
+    fetchTypes: () => Promise<string[] | null>,
+    includes: string[],
+    countOf: Record<string, number>,
+  ): Promise<void> => {
+    const types = await fetchTypes();
+    if (!types) {
+      fail(`${label}: 无法获取事件`);
+      return;
+    }
+    if (!isSubsequence(types, includes)) {
+      fail(`${label}: 事件序列 ${types.join(',')} 未按序包含 ${includes.join(',')}`);
+      return;
+    }
+    for (const [t, n] of Object.entries(countOf)) {
+      const c = types.filter((x) => x === t).length;
+      if (c !== n) {
+        fail(`${label}: ${t} 出现 ${c} 次,期望 ${n} 次`);
+        return;
+      }
+    }
+    ok(`${label} 因果链符合预期(${types.join(' → ')})`);
+  };
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
@@ -85,7 +131,7 @@ export async function runScenario(
         }
 
         case 'submit': {
-          const r = await client.submit(String(step.key), String(step.action), step.params ?? null);
+          const r = await client.submit(String(step.key), String(step.action), step.params ?? null, String(step.line ?? 'default'));
           if (r.status !== 200 && r.status !== 201) {
             fail(`submit ${step.key}: HTTP ${r.status} ${JSON.stringify(r.body)}`);
             break;
@@ -103,19 +149,53 @@ export async function runScenario(
               break;
             }
           }
-          ok(`submit ${step.key} → ${sub.commandId} (deduped=${r.body.deduped})`);
+          ok(`submit ${step.key} → ${sub.commandId} (line=${r.body.lineId}, deduped=${r.body.deduped})`);
+          break;
+        }
+
+        case 'heartbeat': {
+          const gateway = String(step.gateway);
+          const line = String(step.line ?? 'line-1');
+          const r = await client.heartbeat(gateway, line);
+          if (r.status !== 200) {
+            fail(`heartbeat: HTTP ${r.status}`);
+            break;
+          }
+          const expect = String(step.expect ?? 'acquired');
+          if (expect === 'acquired' && !r.body.acquired) {
+            fail(`heartbeat: 期望获得所有权,实际被拒(当前属主 ${r.body.owner} gen=${r.body.generation})`);
+            break;
+          }
+          if (expect === 'rejected' && r.body.acquired) {
+            fail(`heartbeat: 期望被拒,实际获得 gen=${r.body.generation}`);
+            break;
+          }
+          if (step.expectGeneration !== undefined && r.body.generation !== Number(step.expectGeneration)) {
+            fail(`heartbeat: 代际=${r.body.generation},期望 ${step.expectGeneration}`);
+            break;
+          }
+          if (r.body.acquired) generations.set(gateway, r.body.generation);
+          ok(`heartbeat ${gateway}@${line} → ${r.body.acquired ? `属主 gen=${r.body.generation}` : `被拒(属主 ${r.body.owner} gen=${r.body.generation})`}`);
           break;
         }
 
         case 'claim': {
           const gateway = String(step.gateway);
-          const r = await client.claim(gateway, 1);
+          const line = String(step.line ?? 'line-1');
+          const generation = genOf(step, gateway);
+          const r = await client.claim(gateway, line, generation, Number(step.limit ?? 1));
+          const expect = step.expect !== undefined ? String(step.expect) : step.expectEmpty ? 'empty' : 'tasks';
+          if (expect === 'fenced') {
+            if (r.status === 403 && r.body?.error?.code === 'fenced') ok(`claim 被 fencing(${r.body.fenced})`);
+            else fail(`claim: 期望 fenced,实际 HTTP ${r.status} ${JSON.stringify(r.body)}`);
+            break;
+          }
           if (r.status !== 200) {
-            fail(`claim: HTTP ${r.status}`);
+            fail(`claim: HTTP ${r.status} ${JSON.stringify(r.body)}`);
             break;
           }
           const tasks = r.body.tasks as any[];
-          if (step.expectEmpty) {
+          if (expect === 'empty') {
             if (tasks.length === 0) ok('claim 返回空(无可领取任务)');
             else fail(`claim 期望为空,实际拿到 ${tasks.length} 个任务`);
             break;
@@ -127,9 +207,11 @@ export async function runScenario(
           const t = tasks[0];
           const d: Delivery = {
             gateway,
+            lineId: t.lineId,
             commandId: t.commandId,
             executionToken: t.executionToken,
             attemptNo: t.attemptNo,
+            generation: t.generation,
             leaseId: t.leaseId,
           };
           deliveries.set(String(step.as), d);
@@ -140,8 +222,12 @@ export async function runScenario(
               break;
             }
           }
-          if (step.expectAttemptNo !== undefined && t.attemptNo !== step.expectAttemptNo) {
+          if (step.expectAttemptNo !== undefined && t.attemptNo !== Number(step.expectAttemptNo)) {
             fail(`claim: attemptNo=${t.attemptNo},期望 ${step.expectAttemptNo}`);
+            break;
+          }
+          if (step.expectGeneration !== undefined && t.generation !== Number(step.expectGeneration)) {
+            fail(`claim: generation=${t.generation},期望 ${step.expectGeneration}`);
             break;
           }
           if (step.expectExecutionTokenOf) {
@@ -151,7 +237,7 @@ export async function runScenario(
               break;
             }
           }
-          ok(`claim → cmd=${t.commandId} attempt=${t.attemptNo} token=${t.executionToken}`);
+          ok(`claim → cmd=${t.commandId} attempt=${t.attemptNo} gen=${t.generation} token=${t.executionToken}`);
           break;
         }
 
@@ -162,10 +248,13 @@ export async function runScenario(
             break;
           }
           const gateway = String(step.gateway ?? d.gateway);
-          const r = await client.renew(gateway, d.leaseId);
-          const expect = step.expect ?? 'ok';
+          const generation = genOf(step, gateway);
+          const r = await client.renew(gateway, d.leaseId, generation);
+          const expect = String(step.expect ?? 'ok');
+          const fenced = r.status === 409 && String(r.body?.reason ?? '').startsWith('fenced');
           if (expect === 'ok' && r.status === 200 && r.body.ok) ok(`renew 成功,租约延至 ${r.body.leaseExpiresAt}`);
-          else if (expect === 'rejected' && (r.status === 409 || r.body.ok === false)) ok(`renew 被拒(${r.body.reason ?? r.status})`);
+          else if (expect === 'rejected' && r.status === 409 && !fenced) ok(`renew 被拒(${r.body.reason ?? r.status})`);
+          else if (expect === 'fenced' && fenced) ok(`renew 被 fencing(${r.body.reason})`);
           else fail(`renew: 期望 ${expect},实际 HTTP ${r.status} ${JSON.stringify(r.body)}`);
           break;
         }
@@ -176,14 +265,19 @@ export async function runScenario(
             fail(`ack: 未知投递 ${String(step.delivery)}`);
             break;
           }
-          const r = await client.ack(d.gateway, d.leaseId, String(step.ackId), step.result ?? { device: 'ok' });
+          const generation = genOf(step, d.gateway);
+          const r = await client.ack(d.gateway, d.leaseId, generation, String(step.ackId), step.result ?? { device: 'ok' });
           const expect = String(step.expect ?? 'applied');
           if (r.status !== 200) {
             if (expect === 'rejected') ok(`ack 被拒(HTTP ${r.status})`);
             else fail(`ack: HTTP ${r.status} ${JSON.stringify(r.body)}`);
             break;
           }
-          const actual = r.body.duplicate ? 'duplicate' : r.body.outcome;
+          const actual = r.body.duplicate
+            ? 'duplicate'
+            : String(r.body.reason ?? '').startsWith('fenced')
+              ? 'fenced'
+              : r.body.outcome;
           if (actual === expect) {
             ok(`ack ${step.ackId} → ${actual}${r.body.reason ? ` (${r.body.reason})` : ''}`);
           } else {
@@ -237,31 +331,44 @@ export async function runScenario(
             fail('assertEvents: 找不到指令');
             break;
           }
-          const r = await client.getEvents(id);
+          await assertEventView(
+            `指令 ${String(step.key ?? step.command)} 事件`,
+            async () => {
+              const r = await client.getEvents(id!);
+              return r.status === 200 ? (r.body.events as any[]).map((e) => e.type as string) : null;
+            },
+            (step.includes as string[] | undefined) ?? [],
+            (step.countOf as Record<string, number> | undefined) ?? {},
+          );
+          break;
+        }
+
+        case 'assertLineEvents': {
+          const line = String(step.line ?? 'line-1');
+          await assertEventView(
+            `产线 ${line} 事件`,
+            async () => {
+              const r = await client.getLineEvents(line);
+              return r.status === 200 ? (r.body.events as any[]).map((e) => e.type as string) : null;
+            },
+            (step.includes as string[] | undefined) ?? [],
+            (step.countOf as Record<string, number> | undefined) ?? {},
+          );
+          break;
+        }
+
+        case 'assertOwnership': {
+          const line = String(step.line ?? 'line-1');
+          const r = await client.getOwnership(line);
           if (r.status !== 200) {
-            fail(`assertEvents: HTTP ${r.status}`);
+            fail(`assertOwnership: HTTP ${r.status}`);
             break;
           }
-          const types = (r.body.events as any[]).map((e) => e.type as string);
-          const includes = (step.includes as string[] | undefined) ?? [];
-          let idx = 0;
-          for (const t of types) {
-            if (idx < includes.length && t === includes[idx]) idx++;
-          }
-          if (idx !== includes.length) {
-            fail(`assertEvents: 事件序列 ${types.join(',')} 未按序包含 ${includes.join(',')}`);
-            break;
-          }
-          const countOf = (step.countOf as Record<string, number> | undefined) ?? {};
-          for (const [t, n] of Object.entries(countOf)) {
-            const c = types.filter((x) => x === t).length;
-            if (c !== n) {
-              fail(`assertEvents: ${t} 出现 ${c} 次,期望 ${n} 次`);
-              idx = -1;
-              break;
-            }
-          }
-          if (idx === includes.length) ok(`事件因果链符合预期(${types.join(' → ')})`);
+          const problems: string[] = [];
+          if (step.owner !== undefined && r.body.ownerGatewayId !== step.owner) problems.push(`owner=${r.body.ownerGatewayId},期望 ${step.owner}`);
+          if (step.generation !== undefined && r.body.generation !== Number(step.generation)) problems.push(`generation=${r.body.generation},期望 ${step.generation}`);
+          if (problems.length) fail(`assertOwnership: ${problems.join(';')}`);
+          else ok(`产线 ${line} 属主=${r.body.ownerGatewayId} gen=${r.body.generation}`);
           break;
         }
 

@@ -1,6 +1,7 @@
 /**
  * 崩溃恢复集成测试:真实 SQLite 文件,通过"关闭仓库 → 同库重新建服务"
- * 模拟进程崩溃重启,验证恢复边界——服务不依赖任何内存状态。
+ * 模拟进程崩溃重启,验证恢复边界——服务不依赖任何内存状态,
+ * 包括所有权代际:fencing 状态跨重启保持。
  */
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -10,7 +11,7 @@ import { test } from 'node:test';
 import { DispatchService } from '../src/service/dispatchService';
 import { SqliteRepository } from '../src/storage/sqlite';
 
-const config = { leaseTtlMs: 1000, maxAttempts: 2, retryBackoffMs: 100 };
+const config = { leaseTtlMs: 1000, maxAttempts: 2, retryBackoffMs: 100, ownershipLeaseTtlMs: 800 };
 
 function boot(dbPath: string, now: () => number) {
   const repo = new SqliteRepository(dbPath);
@@ -37,12 +38,12 @@ test('恢复:持久化后"崩溃"(未拿到响应),重启后同幂等键重提�
   const h = harness();
   try {
     let a = boot(h.dbPath, h.now);
-    const first = a.service.submit({ idempotencyKey: 'biz-1', action: 'calibrate', params: {} }, 'req-1');
+    const first = a.service.submit({ idempotencyKey: 'biz-1', action: 'calibrate', params: {}, lineId: 'line-1' }, 'req-1');
     // 模拟"持久化已提交、响应未送达"的崩溃:直接丢弃进程状态
     a.repo.close();
 
     const b = boot(h.dbPath, h.now);
-    const retry = b.service.submit({ idempotencyKey: 'biz-1', action: 'calibrate', params: {} }, 'req-2');
+    const retry = b.service.submit({ idempotencyKey: 'biz-1', action: 'calibrate', params: {}, lineId: 'line-1' }, 'req-2');
     assert.equal(retry.commandId, first.commandId, '同一业务请求只有一条指令');
     assert.equal(retry.deduped, true);
 
@@ -54,96 +55,155 @@ test('恢复:持久化后"崩溃"(未拿到响应),重启后同幂等键重提�
   }
 });
 
-test('恢复:网关领走后崩溃,重启后租约仍在;过期后可被其他网关领取且沿用执行身份', () => {
+test('恢复:网关领走后崩溃,重启后租约与所有权仍在;接管后可被其他网关领取且沿用执行身份', () => {
   const h = harness();
   try {
     let a = boot(h.dbPath, h.now);
-    a.service.submit({ idempotencyKey: 'biz-2', action: 'switch', params: {} }, 'req-1');
-    const [t1] = a.service.claim('gw-1', 1, 'req-2');
+    a.service.submit({ idempotencyKey: 'biz-2', action: 'switch', params: {}, lineId: 'line-1' }, 'req-1');
+    a.service.heartbeat('gw-1', 'line-1', 'req-h1');
+    const r1 = a.service.claim('gw-1', 'line-1', 1, 1, 'req-2');
+    assert.ok('tasks' in r1);
+    const t1 = r1.tasks[0];
     a.repo.close(); // 服务崩溃
 
     const b = boot(h.dbPath, h.now);
-    // 租约未过期:其他网关领不到
-    assert.equal(b.service.claim('gw-2', 1, 'req-3').length, 0);
-    // 越过租约:结算过期并进入退避;越过退避后 gw-2 领到同一执行身份的第 2 次尝试
+    // 所有权未易主:其他网关领取被 fencing
+    const fenced = b.service.claim('gw-2', 'line-1', 1, 1, 'req-3');
+    assert.ok('fenced' in fenced && fenced.fenced === 'not_owner');
+    // 主网关心跳中断 → 所有权到期 → gw-2 接管(代际+1,在途投递被中止)
     h.advance(1500);
-    b.service.expireDue();
-    h.advance(200);
-    const [t2] = b.service.claim('gw-2', 1, 'req-4');
-    assert.equal(t2.executionToken, t1.executionToken);
-    assert.equal(t2.attemptNo, 2);
+    const hb = b.service.heartbeat('gw-2', 'line-1', 'req-h2');
+    assert.equal(hb.acquired, true);
+    assert.equal(hb.generation, 2);
+    assert.equal(hb.tookOverFrom, 'gw-1');
+    const r2 = b.service.claim('gw-2', 'line-1', 2, 1, 'req-4');
+    assert.ok('tasks' in r2 && r2.tasks.length === 1);
+    assert.equal(r2.tasks[0].executionToken, t1.executionToken, '重投沿用稳定执行身份');
+    assert.equal(r2.tasks[0].attemptNo, 2);
     b.repo.close();
   } finally {
     h.cleanup();
   }
 });
 
-test('恢复:迟到确认在重启后仍被忽略;只有持久化确认能标成功', () => {
+test('恢复:旧代际迟到确认在重启后仍被 fencing;只有当前代际的持久化确认能标成功', () => {
   const h = harness();
   try {
     let a = boot(h.dbPath, h.now);
-    a.service.submit({ idempotencyKey: 'biz-3', action: 'calibrate', params: {} }, 'req-1');
-    const [t1] = a.service.claim('gw-1', 1, 'req-2');
+    a.service.submit({ idempotencyKey: 'biz-3', action: 'calibrate', params: {}, lineId: 'line-1' }, 'req-1');
+    a.service.heartbeat('gw-1', 'line-1', 'req-h1');
+    const r1 = a.service.claim('gw-1', 'line-1', 1, 1, 'req-2');
+    const t1 = 'tasks' in r1 ? r1.tasks[0] : null;
     h.advance(1500);
-    a.service.expireDue();
-    h.advance(200);
-    const [t2] = a.service.claim('gw-2', 1, 'req-3');
+    a.service.heartbeat('gw-2', 'line-1', 'req-h2'); // 接管 gen=2,中止 t1
+    const r2 = a.service.claim('gw-2', 'line-1', 2, 1, 'req-3');
+    const t2 = 'tasks' in r2 ? r2.tasks[0] : null;
     a.repo.close(); // 崩溃
 
     const b = boot(h.dbPath, h.now);
-    // 旧租约的迟到确认:持久化但忽略
-    const late = b.service.ack(t1.leaseId, 'gw-1', { ackId: 'late-1', result: null }, 'req-5');
+    // 旧网关用旧代际回传确认:持久化留痕但被 fencing,不得推进状态
+    const late = b.service.ack(t1!.leaseId, 'gw-1', { ackId: 'late-1', result: null, generation: 1 }, 'req-5');
     assert.equal(late.outcome, 'ignored');
-    // 当前租约的确认:生效并标成功
-    const ok = b.service.ack(t2.leaseId, 'gw-2', { ackId: 'ok-1', result: { done: true } }, 'req-6');
+    assert.ok(late.reason!.startsWith('fenced'));
+    assert.equal(b.service.getCommand(t2!.commandId)!.status, 'DISPATCHED', '旧代际不得推进状态');
+    // 当前属主、当前代际的确认:生效并标成功
+    const ok = b.service.ack(t2!.leaseId, 'gw-2', { ackId: 'ok-1', result: { done: true }, generation: 2 }, 'req-6');
     assert.equal(ok.outcome, 'applied');
-    assert.equal(b.service.getCommand(t2.commandId)!.status, 'SUCCEEDED');
+    assert.equal(b.service.getCommand(t2!.commandId)!.status, 'SUCCEEDED');
     // 重启后重复确认仍幂等
     b.repo.close();
     const c = boot(h.dbPath, h.now);
-    const dup = c.service.ack(t2.leaseId, 'gw-2', { ackId: 'ok-1', result: { done: true } }, 'req-7');
+    const dup = c.service.ack(t2!.leaseId, 'gw-2', { ackId: 'ok-1', result: { done: true }, generation: 2 }, 'req-7');
     assert.equal(dup.duplicate, true);
-    assert.equal(c.service.getCommand(t2.commandId)!.status, 'SUCCEEDED');
-    // 因果链完整
-    const types = c.service.listEvents(t2.commandId).map((e) => e.type);
+    assert.equal(c.service.getCommand(t2!.commandId)!.status, 'SUCCEEDED');
+    // 因果链完整(指令视角)
+    const types = c.service.listEvents(t2!.commandId).map((e) => e.type);
     assert.deepEqual(types, [
       'COMMAND_ACCEPTED',
       'DELIVERY_STARTED',
-      'LEASE_EXPIRED',
+      'ATTEMPT_ABORTED',
       'RETRY_SCHEDULED',
       'DELIVERY_STARTED',
-      'DEVICE_ACK_IGNORED',
+      'ACK_FENCED',
       'DEVICE_ACK_APPLIED',
       'COMMAND_SUCCEEDED',
       'DEVICE_ACK_DUPLICATE',
     ]);
+    // 产线视角可还原接管因果
+    const lineTypes = c.service.listLineEvents('line-1').map((e) => e.type);
+    for (const t of ['OWNERSHIP_ACQUIRED', 'OWNERSHIP_TAKEN_OVER', 'ATTEMPT_ABORTED', 'ACK_FENCED', 'COMMAND_SUCCEEDED']) {
+      assert.ok(lineTypes.includes(t), `产线事件缺少 ${t}`);
+    }
     c.repo.close();
   } finally {
     h.cleanup();
   }
 });
 
-test('恢复:重试耗尽进入 FAILED 后重启,迟到确认不能复活指令', () => {
+test('恢复:重试耗尽进入 FAILED 后重启,任何确认都不能复活指令', () => {
   const h = harness();
   try {
     let a = boot(h.dbPath, h.now);
-    a.service.submit({ idempotencyKey: 'biz-4', action: 'switch', params: {} }, 'req-1');
-    const [t1] = a.service.claim('gw-1', 1, 'req-2');
+    a.service.submit({ idempotencyKey: 'biz-4', action: 'switch', params: {}, lineId: 'line-1' }, 'req-1');
+    a.service.heartbeat('gw-1', 'line-1', 'req-h1');
+    const r1 = a.service.claim('gw-1', 'line-1', 1, 1, 'req-2');
+    const t1 = 'tasks' in r1 ? r1.tasks[0] : null;
     h.advance(1500);
-    a.service.expireDue();
-    h.advance(200);
-    const [t2] = a.service.claim('gw-1', 1, 'req-3');
+    a.service.heartbeat('gw-1', 'line-1', 'req-h2'); // 所有权过期,自行重新获取 gen=2,中止在途投递
+    const r2 = a.service.claim('gw-1', 'line-1', 2, 1, 'req-3');
+    const t2 = 'tasks' in r2 ? r2.tasks[0] : null;
     h.advance(1500);
     a.service.expireDue(); // 结算第二次过期 → FAILED
-    assert.equal(a.service.getCommand(t1.commandId)!.status, 'FAILED');
+    assert.equal(a.service.getCommand(t1!.commandId)!.status, 'FAILED');
     a.repo.close();
 
     const b = boot(h.dbPath, h.now);
-    const late = b.service.ack(t2.leaseId, 'gw-1', { ackId: 'ghost', result: null }, 'req-9');
+    // 旧代际(gen=2,所有权已过期)的确认:fencing
+    const fenced = b.service.ack(t2!.leaseId, 'gw-1', { ackId: 'ghost-1', result: null, generation: 2 }, 'req-8');
+    assert.equal(fenced.outcome, 'ignored');
+    assert.ok(fenced.reason!.startsWith('fenced'));
+    // 重新获取所有权(gen=3)后的确认:终态忽略
+    b.service.heartbeat('gw-1', 'line-1', 'req-h3');
+    const late = b.service.ack(t2!.leaseId, 'gw-1', { ackId: 'ghost-2', result: null, generation: 3 }, 'req-9');
     assert.equal(late.outcome, 'ignored');
     assert.equal(late.reason, 'command_terminal');
-    assert.equal(b.service.getCommand(t1.commandId)!.status, 'FAILED');
+    assert.equal(b.service.getCommand(t1!.commandId)!.status, 'FAILED');
     b.repo.close();
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('恢复:所有权代际跨重启保持——接管后崩溃重启,旧代际依旧被 fencing', () => {
+  const h = harness();
+  try {
+    let a = boot(h.dbPath, h.now);
+    a.service.submit({ idempotencyKey: 'biz-5', action: 'calibrate', params: {}, lineId: 'line-1' }, 'req-1');
+    a.service.heartbeat('gw-1', 'line-1', 'req-h1');
+    const r1 = a.service.claim('gw-1', 'line-1', 1, 1, 'req-2');
+    const t1 = 'tasks' in r1 ? r1.tasks[0] : null;
+    a.repo.close(); // 崩溃①
+
+    const b = boot(h.dbPath, h.now);
+    // 重启后所有权未丢:gw-2 仍被 fencing
+    assert.ok('fenced' in b.service.claim('gw-2', 'line-1', 1, 1, 'req-3'));
+    h.advance(1500);
+    const hb = b.service.heartbeat('gw-2', 'line-1', 'req-h2'); // 接管 gen=2
+    assert.equal(hb.generation, 2);
+    b.repo.close(); // 崩溃②:接管刚落库即宕机
+
+    const c = boot(h.dbPath, h.now);
+    const own = c.service.getOwnership('line-1')!;
+    assert.equal(own.ownerGatewayId, 'gw-2', '接管结果跨重启保持');
+    assert.equal(own.generation, 2);
+    // 旧网关持旧代际的一切操作依旧被 fencing
+    const fencedAck = c.service.ack(t1!.leaseId, 'gw-1', { ackId: 'partition-1', result: null, generation: 1 }, 'req-4');
+    assert.ok(fencedAck.reason!.startsWith('fenced'));
+    assert.ok('fenced' in c.service.claim('gw-1', 'line-1', 1, 1, 'req-5'));
+    // 新属主继续重投:执行身份沿用
+    const r2 = c.service.claim('gw-2', 'line-1', 2, 1, 'req-6');
+    assert.ok('tasks' in r2 && r2.tasks[0].executionToken === t1!.executionToken);
+    c.repo.close();
   } finally {
     h.cleanup();
   }

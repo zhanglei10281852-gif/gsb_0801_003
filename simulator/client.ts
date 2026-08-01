@@ -1,6 +1,6 @@
 /**
  * 模拟器 HTTP 客户端:封装对调度服务的全部网关/上游调用,带超时控制,
- * 便于复现断网(请求超时/不发请求)等故障。
+ * 便于复现断网(请求超时/不发请求)、网络分区(旧代际继续发)等故障。
  */
 export interface ClientOptions {
   baseUrl: string;
@@ -42,8 +42,8 @@ async function request(
 export class DispatchClient {
   constructor(private opts: ClientOptions) {}
 
-  async submit(idempotencyKey: string, action: string, params: unknown) {
-    return request(this.opts, 'POST', '/v1/commands', { idempotencyKey, action, params });
+  async submit(idempotencyKey: string, action: string, params: unknown, lineId = 'default') {
+    return request(this.opts, 'POST', '/v1/commands', { idempotencyKey, action, params, lineId });
   }
 
   async getCommand(idOrKey: string) {
@@ -54,16 +54,29 @@ export class DispatchClient {
     return request(this.opts, 'GET', `/v1/commands/${encodeURIComponent(commandId)}/events`);
   }
 
-  async claim(gatewayId: string, limit = 1) {
-    return request(this.opts, 'POST', '/v1/gateway/claims', { gatewayId, limit });
+  /** 心跳:获取/续约产线所有权。回复含 acquired/generation/owner/leaseExpiresAt */
+  async heartbeat(gatewayId: string, lineId: string) {
+    return request(this.opts, 'POST', '/v1/gateway/heartbeats', { gatewayId, lineId });
   }
 
-  async renew(gatewayId: string, leaseId: string) {
-    return request(this.opts, 'POST', '/v1/gateway/renewals', { gatewayId, leaseId });
+  async claim(gatewayId: string, lineId: string, generation: number, limit = 1) {
+    return request(this.opts, 'POST', '/v1/gateway/claims', { gatewayId, lineId, generation, limit });
   }
 
-  async ack(gatewayId: string, leaseId: string, ackId: string, result: unknown) {
-    return request(this.opts, 'POST', '/v1/gateway/acks', { gatewayId, leaseId, ackId, result });
+  async renew(gatewayId: string, leaseId: string, generation: number) {
+    return request(this.opts, 'POST', '/v1/gateway/renewals', { gatewayId, leaseId, generation });
+  }
+
+  async ack(gatewayId: string, leaseId: string, generation: number, ackId: string, result: unknown) {
+    return request(this.opts, 'POST', '/v1/gateway/acks', { gatewayId, leaseId, generation, ackId, result });
+  }
+
+  async getOwnership(lineId: string) {
+    return request(this.opts, 'GET', `/v1/lines/${encodeURIComponent(lineId)}/ownership`);
+  }
+
+  async getLineEvents(lineId: string) {
+    return request(this.opts, 'GET', `/v1/lines/${encodeURIComponent(lineId)}/events`);
   }
 
   async health() {
