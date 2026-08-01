@@ -1,0 +1,29 @@
+{
+  "name": "edge-command-dispatch",
+  "version": "1.0.0",
+  "description": "Reliable edge device command dispatch service with idempotency, lease, and event-sourced state machine",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "install:deps": "npm install",
+    "build": "tsc",
+    "start": "node dist/src/server/http-server.js",
+    "test": "node --import tsx ./tools/run-tests.ts",
+    "test:unit": "node --import tsx ./tools/run-tests.ts",
+    "test:e2e": "node --import tsx ./test/e2e/acceptance.ts",
+    "acceptance": "npm run build && node --import tsx ./test/e2e/acceptance.ts",
+    "simulate": "node --import tsx ./tools/simulator/cli.ts",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true});require('fs').rmSync('data',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.10",
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
