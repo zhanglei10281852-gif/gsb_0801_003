@@ -26,6 +26,12 @@ heartbeat lapses, takeover bumps the generation, and every command operation is
 fenced by generation so an old primary cannot lease work or push a confirmation
 after it has been superseded.
 
+Upstream can also **emergency-recall** a not-yet-completed action, or submit an
+explicit **superseding safety command** that replaces an in-flight one. An action
+that has already been device-confirmed can never be dressed up as a "successful
+cancel", and a superseding submit never rewrites a persisted success. The
+recall/replace/reject history is queryable as one causal chain.
+
 Stack: **Node.js 20+, TypeScript, SQLite** (via `better-sqlite3`). No Docker, no
 Redis, no remote services. Everything runs from a local SQLite file.
 
@@ -121,13 +127,23 @@ interleaving can be reproduced exactly in a unit test.
 ```
  submit                lease                 confirm(success)
 ──────────▶ PENDING ─────────────▶ LEASED ────────────────────▶ SUCCEEDED (terminal)
-              ▲                    │  │
-              │ requeue (budget    │  │ confirm(failure)
-              │ remains)           │  └──────────────────────────▶ FAILED (terminal)
-              │                    │
-              └──── expire ────────┘  (lease deadline passed; reaper or next lease)
+              ▲     \              │  │
+              │      \ cancel       │  │ confirm(failure)
+              │       \ supersede   │  └──────────────────────────▶ FAILED (terminal)
+              │        \            │
+              │         ▼           │  (from PENDING or LEASED:)
+              │   CANCELLED /       │   cancel     ─────────────▶ CANCELLED (terminal)
+              │   SUPERSEDED        │   supersede  ─────────────▶ SUPERSEDED (terminal)
+              │   (terminal)        │
+              └──── expire ─────────┘  (lease deadline passed; reaper or next lease)
                                        exhausted budget ─────────▶ FAILED (terminal)
 ```
+
+Terminal states are `SUCCEEDED`, `FAILED`, `CANCELLED`, `SUPERSEDED`. A cancel or
+supersede is only valid from `PENDING`/`LEASED`; attempted against an already
+terminal command it is **refused** (a device-confirmed `SUCCEEDED` action cannot
+become a fake successful cancel, and a persisted success is never rewritten to
+`SUPERSEDED` — a `SUPERSEDE_NOTED` audit event records the reference instead).
 
 ### Three identities that make it safe
 
@@ -160,13 +176,16 @@ Every state change appends immutable rows to an `events` table. Events are
 
 - command: `SUBMITTED, SUBMIT_DEDUPED, LEASED, RENEWED, RENEW_REJECTED,
   LEASE_EXPIRED, REQUEUED, CONFIRMED_SUCCESS, CONFIRMED_FAILURE, CONFIRM_IGNORED,
-  EXHAUSTED, LEASE_FENCED, PREEMPTED`
+  EXHAUSTED, LEASE_FENCED, PREEMPTED, CANCELLED, CANCEL_REJECTED, SUPERSEDED,
+  SUPERSEDE_NOTED`
 - line: `OWNERSHIP_ACQUIRED, OWNERSHIP_RENEWED, OWNERSHIP_TAKEOVER,
   OWNERSHIP_REJECTED`
 
 Operators reconstruct *why* a command is where it is (each timeout, retry,
-takeover, fenced/ignored late message) via `GET /commands/:id/events`,
-`GET /ops/lines/:lineId/events`, and `GET /ops/events`.
+takeover, fenced/ignored late message, recall, or replacement) via
+`GET /commands/:id/events`, `GET /ops/lines/:lineId/events`, `GET /ops/events`,
+and — for the recall/replace lineage as one merged, time-ordered chain —
+`GET /commands/:id/chain`.
 
 ---
 
@@ -175,13 +194,25 @@ takeover, fenced/ignored late message) via `GET /commands/:id/events`,
 **Upstream (scheduling system)**
 
 - `POST /commands` — submit a command. Body:
-  `{ "idempotencyKey": "...", "deviceId": "...", "kind": "calibrate", "params": {}, "maxAttempts": 5, "lineId": "optional" }`.
+  `{ "idempotencyKey": "...", "deviceId": "...", "kind": "calibrate", "params": {}, "maxAttempts": 5, "lineId": "optional", "supersedesId": "optional", "supersedeReason": "optional", "requestedBy": "optional" }`.
   Returns `201` on first create, `200` with `"deduped": true` on any resubmit of
   the same `idempotencyKey` (returns the existing command — **never** a second
-  one). `lineId` defaults to `"default"`.
+  one). `lineId` defaults to `"default"`. When `supersedesId` is set the referenced
+  command is atomically marked `SUPERSEDED` in the same transaction if it is still
+  active (or left untouched with a `SUPERSEDE_NOTED` audit event if already
+  terminal); the new command records `supersedesId` for lineage.
+- `POST /commands/:id/cancel` — emergency recall. Body:
+  `{ "reason": "optional", "requestedBy": "optional" }`. `200` `{ cancelled: true }`
+  when a `PENDING`/`LEASED` command is moved to `CANCELLED`; `409`
+  `{ cancelled: false, reason }` when refused because the command is already
+  terminal (e.g. `already_succeeded` — a confirmed action cannot be faked into a
+  successful cancel).
 - `GET /commands/:id` — current state of one command.
 - `GET /commands?key=<idempotencyKey>` — look up by business key.
 - `GET /commands/:id/events` — full causal history for that command.
+- `GET /commands/:id/chain` — recall/replace lineage: the ordered chain of
+  commands linked by `supersedesId` plus every command-scoped event across the
+  whole chain, in global time order.
 
 **Gateway (edge, redundant)**
 
@@ -240,6 +271,10 @@ npm run sim -- takeover --url http://127.0.0.1:8080 --lease-ms 1500
 | `takeover` | primary owns a line, leases, vanishes; standby takes over | standby refused while primary healthy, then takeover bumps 代际; same `executionId`; one device action |
 | `split-brain` | partitioned old primary keeps its stale generation | old primary's lease attempt fenced (`204`) and its late confirm fenced (`stale_generation`); device acted once; standby completes it |
 | `ownership-expiry` | standby claims a healthy vs. lapsed line | rejected while healthy, heartbeat keeps generation stable, takeover after lapse bumps generation |
+| `emergency-cancel` | recall a not-yet-completed action | command → CANCELLED; a late confirm cannot revive it |
+| `cancel-after-success` | recall arrives after the device confirmed | recall **refused** (`already_succeeded`); status stays SUCCEEDED; one device action |
+| `supersede` | a safety command replaces an in-flight one | old → SUPERSEDED atomically; only the replacement is leasable; `/chain` links both with a SUPERSEDED event |
+| `stale-gateway-after-supersede` | old gateway reconnects after supersede + takeover | its late confirm is fenced/ignored, the target is terminal, the replacement completes; the two intents are two distinct device actions |
 
 Each scenario prints a report and exits `0` on pass, non-zero on fail.
 
@@ -249,7 +284,7 @@ Each scenario prints a report and exits `0` on pass, non-zero on fail.
 compiles the project, starts the **compiled** server (`dist/main.js`) as a child
 process against a fresh temp SQLite file, runs every simulator scenario as
 separate processes, prints a sample of the causal event log, and then performs
-two recovery checks:
+three recovery checks:
 
 - **crash-recovery** — `SIGKILL`s the server after a command is persisted,
   restarts it against the same database file, and verifies the command survived
@@ -258,6 +293,10 @@ two recovery checks:
 - **ownership-recovery** — after a takeover bumps the generation, `SIGKILL`s and
   restarts the server, and verifies the persisted generation is unchanged (an old
   generation stays fenced across restarts).
+- **cancel/supersede-recovery** — `SIGKILL`s and restarts after a cancel and a
+  success, then verifies a `CANCELLED` command stays cancelled and re-cancel is
+  refused, and a recall of the `SUCCEEDED` command is still refused with
+  `already_succeeded`.
 
 Exits non-zero if anything fails.
 
@@ -289,13 +328,25 @@ Exits non-zero if anything fails.
   owner's heartbeat lapses; generation strictly increases and is persisted, so a
   restarted or partitioned old owner can never regain authority for its old
   generation.
+- **Honest recall / replace.** A cancel or supersede only ever terminates a
+  still-active command. A recall of an already device-confirmed action is
+  **refused** (`already_succeeded`) — it is never dressed up as a successful
+  cancel — and a superseding submit never rewrites a persisted `SUCCEEDED`/
+  `FAILED` into `SUPERSEDED` (it records a `SUPERSEDE_NOTED` reference instead).
+  Superseding an active command is atomic with creating its replacement, so a
+  reader never sees two live commands for one intent, and the `supersedesId` link
+  makes the whole recall/replace history queryable as one causal chain.
 - **Durability.** SQLite runs in WAL mode with `synchronous = FULL`, so an
   acknowledged (committed) write survives a process crash or power loss.
   Command/ownership mutations and their causal events commit in a **single
   transaction**.
 - **Explainable causality.** Every transition appends an event; the final status
   is always backed by an ordered, inspectable history that includes ownership
-  takeovers and fenced messages.
+  takeovers, fenced messages, recalls, and replacements.
+- **Schema forward-compatibility across rounds.** An existing SQLite file from an
+  earlier round is upgraded in place by additive, idempotent migrations
+  (`line_id`, `owner_generation`, `supersedes_id` are back-filled), so persisted
+  commands survive a version bump. Covered by `test/migration.test.ts`.
 
 ## What this design does NOT promise (honest limits)
 
@@ -328,6 +379,13 @@ Exits non-zero if anything fails.
 - **`FAILED` after `MAX_ATTEMPTS` is "unknown outcome", not "device rejected".**
   Retry exhaustion means we never received a confirmation; the physical device
   state is undetermined and needs operator follow-up.
+- **Cancel is best-effort against physical reality.** A recall only guarantees
+  the *service* will not report the action succeeded and will not dispatch it
+  further. If the device already physically acted (e.g. the confirmation was
+  merely in flight), the recall is refused; if it acted but the confirmation was
+  lost, the recall may succeed at the service level while the hardware already
+  moved. The operator sees the honest status, but stopping in-progress physical
+  motion needs a device/actuator-level e-stop, which is out of scope.
 - **No authentication / authorization / transport encryption.** This is a local
   reference backend; put it behind your own trust boundary.
 
@@ -335,7 +393,8 @@ Exits non-zero if anything fails.
 
 - The SQLite file is the single source of truth. On startup there is **no
   in-memory state to rebuild**; the process simply reopens the file.
-- A command that was `SUCCEEDED`/`FAILED` before the crash stays terminal.
+- A command that was `SUCCEEDED`/`FAILED`/`CANCELLED`/`SUPERSEDED` before the
+  crash stays in that terminal state, and a post-restart recall of it is refused.
 - A command left `LEASED` whose lease has expired is requeued by the reaper (or
   taken over on the next lease). One that is still within its lease window is
   left alone until it expires.
@@ -343,6 +402,8 @@ Exits non-zero if anything fails.
 - **Line ownership and its generation survive the restart.** The current
   generation is persisted, so an old-generation gateway that reconnects after a
   restart is still fenced; the standby that took over remains authoritative.
+- **Recall/replace lineage survives the restart.** `supersedesId` links are
+  persisted, so `GET /commands/:id/chain` still reconstructs the full chain.
 - Only writes that **committed** before the crash survive. A request whose
   transaction had not committed is lost — which is exactly why upstream must
   retry with the same `idempotencyKey` (safe), gateways must re-lease (safe,
@@ -357,18 +418,40 @@ Exits non-zero if anything fails.
 src/
   domain/          pure state machines + types (no I/O)
     types.ts         Command, LineOwnership, DomainEvent, transitions
-    stateMachine.ts  command transitions + attemptEpoch/generation fencing
+    stateMachine.ts  command transitions + attemptEpoch/generation fencing + cancel/supersede
     ownership.ts     line ownership: acquire / heartbeat / takeover (代际)
   ports.ts         Repository / Clock / IdGenerator interfaces
-  adapters/        sqliteRepository, inMemoryRepository, clock/id
-  app/             DispatchService (orchestration, transactions, ownership)
+  adapters/        sqliteRepository (+ additive migrations), inMemoryRepository, clock/id
+  app/             DispatchService (orchestration, transactions, ownership, cancel/supersede, lineage)
   http/            Node core http adapter
   sim/             httpClient, device, gateway (ownership-aware), scenario CLI
-  e2e/             acceptance runner (compiled server + simulator + crash/ownership recovery)
+  e2e/             acceptance runner (compiled server + simulator + crash/ownership/cancel recovery)
   main.ts          composition root (wiring + reaper + shutdown)
 test/
   domain.test.ts     pure command transitions, manual timestamps
   ownership.test.ts  ownership代际 + generation fencing / takeover / split-brain / preemption
+  cancel.test.ts     cancel/supersede transitions, refusal safety, lineage chains
+  migration.test.ts  a round-1 schema DB upgrades in place and stays usable
   service.test.ts    crash/timeout interleavings via in-memory repo + manual clock
-  http.test.ts       real SQLite + http server integration (incl. ownership + fencing)
+  http.test.ts       real SQLite + http server integration (ownership, fencing, cancel, chain)
 ```
+
+## Consistency across the three rounds
+
+The state machine, persistence, and simulator conventions are kept consistent as
+features were layered on:
+
+- **State machine**: `isTerminal` is the single source of truth for terminality
+  and covers all four terminal states (`SUCCEEDED`, `FAILED`, `CANCELLED`,
+  `SUPERSEDED`); `lease`, `confirm`, `renew`, and `expire` all defer to it, so
+  cancelled/superseded commands are automatically un-leasable, un-sweepable, and
+  reject late confirmations exactly like the original terminal states.
+- **Persistence**: every round added only nullable/defaulted columns to
+  `commands` plus new tables; `SqliteRepository.migrate()` back-fills them on an
+  older file, and both the SQLite and in-memory repositories implement the same
+  `Repository`/`RepoTx` port so the deterministic tests and the durable runtime
+  share identical semantics.
+- **Simulator**: one `SimGateway`/`SimDevice` model is reused across all rounds —
+  the device still dedups on `executionId`, ownership generation is stamped on
+  every operation, and cancel/supersede are just new operator calls. Every
+  scenario asserts the device-action count so no layer can silently double-act.

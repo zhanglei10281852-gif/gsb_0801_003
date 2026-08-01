@@ -64,6 +64,9 @@ export interface Repository {
   /** Snapshot list of all line ownership records. */
   listOwnership(): LineOwnership[];
 
+  /** The command (if any) that was submitted to explicitly supersede `id`. */
+  findBySupersedesId(id: string): Command | null;
+
   close(): void;
 }
 

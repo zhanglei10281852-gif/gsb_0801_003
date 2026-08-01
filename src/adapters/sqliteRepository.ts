@@ -34,6 +34,7 @@ interface CommandRow {
   leaseholder: string | null;
   lease_expires_at: number | null;
   owner_generation: number | null;
+  supersedes_id: string | null;
   terminal_reason: string | null;
   created_at: number;
   updated_at: number;
@@ -75,6 +76,7 @@ function rowToCommand(r: CommandRow): Command {
     leaseholder: r.leaseholder,
     leaseExpiresAt: r.lease_expires_at,
     ownerGeneration: r.owner_generation,
+    supersedesId: r.supersedes_id,
     terminalReason: r.terminal_reason,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -105,12 +107,16 @@ function rowToOwnership(r: OwnershipRow): LineOwnership {
   };
 }
 
-const SCHEMA = `
+// Base tables. `CREATE TABLE IF NOT EXISTS` is a no-op on an existing (possibly
+// older-round) `commands` table; additive columns are then reconciled by
+// migrate(), and indexes are created AFTER migration so they can reference
+// back-filled columns on an upgraded DB.
+const TABLES = `
 CREATE TABLE IF NOT EXISTS commands (
   id               TEXT PRIMARY KEY,
   idempotency_key  TEXT NOT NULL UNIQUE,
   execution_id     TEXT NOT NULL,
-  line_id          TEXT NOT NULL,
+  line_id          TEXT NOT NULL DEFAULT 'default',
   payload          TEXT NOT NULL,
   status           TEXT NOT NULL,
   attempt_epoch    INTEGER NOT NULL,
@@ -120,14 +126,11 @@ CREATE TABLE IF NOT EXISTS commands (
   leaseholder      TEXT,
   lease_expires_at INTEGER,
   owner_generation INTEGER,
+  supersedes_id    TEXT,
   terminal_reason  TEXT,
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
-CREATE INDEX IF NOT EXISTS idx_commands_line ON commands(line_id, status);
-CREATE INDEX IF NOT EXISTS idx_commands_lease_expiry ON commands(status, lease_expires_at);
 
 CREATE TABLE IF NOT EXISTS line_ownership (
   line_id     TEXT PRIMARY KEY,
@@ -149,7 +152,13 @@ CREATE TABLE IF NOT EXISTS events (
   generation    INTEGER,
   detail        TEXT NOT NULL
 );
+`;
 
+const INDEXES = `
+CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
+CREATE INDEX IF NOT EXISTS idx_commands_line ON commands(line_id, status);
+CREATE INDEX IF NOT EXISTS idx_commands_lease_expiry ON commands(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_commands_supersedes ON commands(supersedes_id);
 CREATE INDEX IF NOT EXISTS idx_events_subject ON events(subject_id, seq);
 `;
 
@@ -171,7 +180,40 @@ export class SqliteRepository implements Repository {
     this.db.pragma('synchronous = FULL');
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('busy_timeout = 5000');
-    this.db.exec(SCHEMA);
+    this.db.exec(TABLES);
+    this.migrate();
+    this.db.exec(INDEXES);
+  }
+
+  /**
+   * Additive, idempotent migrations so a database created by an earlier round
+   * keeps working after an in-place upgrade. `CREATE TABLE IF NOT EXISTS` does
+   * NOT add columns to an existing table, so round-2 (`line_id`,
+   * `owner_generation`) and round-3 (`supersedes_id`) columns are back-filled
+   * here for older files. This keeps the persistence contract consistent across
+   * all three rounds' schemas.
+   */
+  private migrate(): void {
+    const cols = new Set(
+      (this.db.prepare(`PRAGMA table_info(commands)`).all() as { name: string }[]).map(
+        (c) => c.name,
+      ),
+    );
+    const addColumn = (name: string, ddl: string, backfill?: string) => {
+      if (!cols.has(name)) {
+        this.db.exec(`ALTER TABLE commands ADD COLUMN ${ddl}`);
+        if (backfill) this.db.exec(backfill);
+      }
+    };
+    // Round 2:
+    addColumn(
+      'line_id',
+      `line_id TEXT NOT NULL DEFAULT 'default'`,
+      `UPDATE commands SET line_id = 'default' WHERE line_id IS NULL`,
+    );
+    addColumn('owner_generation', `owner_generation INTEGER`);
+    // Round 3:
+    addColumn('supersedes_id', `supersedes_id TEXT`);
   }
 
   transaction<T>(work: (tx: RepoTx) => T): T {
@@ -274,6 +316,13 @@ export class SqliteRepository implements Repository {
     return rows.map(rowToOwnership);
   }
 
+  findBySupersedesId(id: string): Command | null {
+    const row = this.db
+      .prepare('SELECT * FROM commands WHERE supersedes_id = ? ORDER BY created_at ASC LIMIT 1')
+      .get(id) as CommandRow | undefined;
+    return row ? rowToCommand(row) : null;
+  }
+
   close(): void {
     this.db.close();
   }
@@ -320,11 +369,11 @@ class SqliteTx implements RepoTx {
         `INSERT INTO commands
           (id, idempotency_key, execution_id, line_id, payload, status, attempt_epoch,
            attempts, max_attempts, lease_id, leaseholder, lease_expires_at,
-           owner_generation, terminal_reason, created_at, updated_at)
+           owner_generation, supersedes_id, terminal_reason, created_at, updated_at)
          VALUES
           (@id, @idempotency_key, @execution_id, @line_id, @payload, @status, @attempt_epoch,
            @attempts, @max_attempts, @lease_id, @leaseholder, @lease_expires_at,
-           @owner_generation, @terminal_reason, @created_at, @updated_at)`,
+           @owner_generation, @supersedes_id, @terminal_reason, @created_at, @updated_at)`,
       )
       .run(this.toRow(c));
   }
@@ -341,6 +390,7 @@ class SqliteTx implements RepoTx {
            leaseholder = @leaseholder,
            lease_expires_at = @lease_expires_at,
            owner_generation = @owner_generation,
+           supersedes_id = @supersedes_id,
            terminal_reason = @terminal_reason,
            updated_at = @updated_at
          WHERE id = @id`,
@@ -411,6 +461,7 @@ class SqliteTx implements RepoTx {
       leaseholder: c.leaseholder,
       lease_expires_at: c.leaseExpiresAt,
       owner_generation: c.ownerGeneration,
+      supersedes_id: c.supersedesId,
       terminal_reason: c.terminalReason,
       created_at: c.createdAt,
       updated_at: c.updatedAt,

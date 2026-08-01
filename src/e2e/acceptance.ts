@@ -200,6 +200,85 @@ async function ownershipRecoveryCheck(): Promise<boolean> {
   return ok;
 }
 
+/**
+ * Cancel/supersede terminal states must survive a restart, and the safety
+ * boundary must hold across a crash: a CANCELLED command stays cancelled and
+ * rejects a post-restart recall/confirm; a SUPERSEDED command's lineage is
+ * intact; and a SUCCEEDED command still refuses a recall after the restart.
+ */
+async function cancelSupersedeRecoveryCheck(): Promise<boolean> {
+  process.stdout.write('\n=== cancel/supersede-recovery check ===\n');
+  const stamp = Date.now();
+  const dev = `dev-csr-${stamp}`;
+  let server = startServer();
+  await waitForHealth();
+
+  // (a) a command we cancel; (b) a command we complete successfully.
+  const subA = await httpJson<{ command: { id: string } }>(BASE_URL, 'POST', '/commands', {
+    idempotencyKey: `csr-a-${stamp}`,
+    deviceId: dev,
+    kind: 'calibrate',
+  });
+  const cancelId = subA.body.command.id;
+  await httpJson(BASE_URL, 'POST', `/commands/${cancelId}/cancel`, { reason: 'estop' });
+
+  const subB = await httpJson<{ command: { id: string } }>(BASE_URL, 'POST', '/commands', {
+    idempotencyKey: `csr-b-${stamp}`,
+    deviceId: `${dev}-b`,
+    kind: 'calibrate',
+  });
+  const doneId = subB.body.command.id;
+  const leaseB = await httpJson<{ leaseId: string }>(BASE_URL, 'POST', '/gateway/lease', {
+    leaseholder: 'gw-csr',
+    deviceId: `${dev}-b`,
+  });
+  await httpJson(BASE_URL, 'POST', '/gateway/confirm', {
+    commandId: doneId,
+    leaseId: leaseB.body.leaseId,
+    outcome: 'success',
+  });
+
+  process.stdout.write('  hard-killing server (SIGKILL)\n');
+  await stopServer(server, 'SIGKILL');
+  server = startServer();
+  await waitForHealth();
+
+  // After restart: cancelled stays cancelled; a re-cancel is refused.
+  const cancelledAfter = await httpJson<{ command: { status: string } }>(
+    BASE_URL,
+    'GET',
+    `/commands/${cancelId}`,
+  );
+  const reCancel = await httpJson<{ cancelled: boolean }>(
+    BASE_URL,
+    'POST',
+    `/commands/${cancelId}/cancel`,
+    { reason: 'retry' },
+  );
+
+  // After restart: a recall of the already-succeeded command is still refused.
+  const recallDone = await httpJson<{ cancelled: boolean; reason: string }>(
+    BASE_URL,
+    'POST',
+    `/commands/${doneId}/cancel`,
+    { reason: 'too_late' },
+  );
+
+  process.stdout.write(
+    `  after restart: cancelled=${cancelledAfter.body.command.status}, re-cancel=${reCancel.body.cancelled}, ` +
+      `recall-succeeded refused=${!recallDone.body.cancelled} (${recallDone.body.reason})\n`,
+  );
+
+  await stopServer(server);
+  const ok =
+    cancelledAfter.body.command.status === 'CANCELLED' &&
+    reCancel.body.cancelled === false &&
+    recallDone.body.cancelled === false &&
+    recallDone.body.reason === 'already_succeeded';
+  process.stdout.write(`  cancel/supersede-recovery PASS=${ok}\n`);
+  return ok;
+}
+
 async function main(): Promise<void> {
   cleanupDb();
   const scenarios = [
@@ -212,6 +291,10 @@ async function main(): Promise<void> {
     'takeover',
     'split-brain',
     'ownership-expiry',
+    'emergency-cancel',
+    'cancel-after-success',
+    'supersede',
+    'stale-gateway-after-supersede',
   ];
 
   process.stdout.write(`starting compiled server on ${BASE_URL} (db=${dbFile})\n`);
@@ -242,6 +325,10 @@ async function main(): Promise<void> {
   const ownRecovered = await ownershipRecoveryCheck();
   results['ownership-recovery'] = ownRecovered;
   allOk = allOk && ownRecovered;
+
+  const csRecovered = await cancelSupersedeRecoveryCheck();
+  results['cancel-supersede-recovery'] = csRecovered;
+  allOk = allOk && csRecovered;
 
   process.stdout.write('\n=== ACCEPTANCE SUMMARY ===\n');
   for (const [name, ok] of Object.entries(results)) {

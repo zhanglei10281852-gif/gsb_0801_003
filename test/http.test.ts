@@ -281,3 +281,83 @@ test('a stale-generation confirmation is fenced with 409 over HTTP', async () =>
   assert.equal(late.body.accepted, false);
   assert.equal(late.body.reason, 'stale_generation');
 });
+
+test('emergency cancel over HTTP: 200 on active, then recall of a succeeded cmd is 409', async () => {
+  const dev = `dev-cancel-http-${Date.now()}`;
+  // (a) cancel a PENDING command.
+  const subA = await httpJson<{ command: { id: string } }>(baseUrl, 'POST', '/commands', {
+    idempotencyKey: `cancel-a-${Date.now()}`,
+    deviceId: dev,
+    kind: 'calibrate',
+  });
+  const cancelId = subA.body.command.id;
+  const c = await httpJson<{ cancelled: boolean; status: string }>(
+    baseUrl,
+    'POST',
+    `/commands/${cancelId}/cancel`,
+    { reason: 'estop' },
+  );
+  assert.equal(c.status, 200);
+  assert.equal(c.body.cancelled, true);
+  assert.equal(c.body.status, 'CANCELLED');
+
+  // (b) complete a command, then a recall must be refused with 409.
+  const devB = `${dev}-b`;
+  const subB = await httpJson<{ command: { id: string } }>(baseUrl, 'POST', '/commands', {
+    idempotencyKey: `cancel-b-${Date.now()}`,
+    deviceId: devB,
+    kind: 'calibrate',
+  });
+  const doneId = subB.body.command.id;
+  const lease = await httpJson<{ leaseId: string }>(baseUrl, 'POST', '/gateway/lease', {
+    leaseholder: 'gw-c',
+    deviceId: devB,
+  });
+  await httpJson(baseUrl, 'POST', '/gateway/confirm', {
+    commandId: doneId,
+    leaseId: lease.body.leaseId,
+    outcome: 'success',
+  });
+  const refused = await httpJson<{ cancelled: boolean; reason: string }>(
+    baseUrl,
+    'POST',
+    `/commands/${doneId}/cancel`,
+    { reason: 'too_late' },
+  );
+  assert.equal(refused.status, 409);
+  assert.equal(refused.body.cancelled, false);
+  assert.equal(refused.body.reason, 'already_succeeded');
+});
+
+test('supersede via submit + /chain lineage over HTTP', async () => {
+  const dev = `dev-sup-http-${Date.now()}`;
+  const oldSub = await httpJson<{ command: { id: string } }>(baseUrl, 'POST', '/commands', {
+    idempotencyKey: `sup-old-${Date.now()}`,
+    deviceId: dev,
+    kind: 'switch_process',
+  });
+  const oldId = oldSub.body.command.id;
+  const newSub = await httpJson<{ command: { id: string } }>(baseUrl, 'POST', '/commands', {
+    idempotencyKey: `sup-new-${Date.now()}`,
+    deviceId: dev,
+    kind: 'switch_process',
+    supersedesId: oldId,
+    supersedeReason: 'safety',
+  });
+  const newId = newSub.body.command.id;
+
+  const oldAfter = await httpJson<{ command: { status: string } }>(
+    baseUrl,
+    'GET',
+    `/commands/${oldId}`,
+  );
+  assert.equal(oldAfter.body.command.status, 'SUPERSEDED');
+
+  const chain = await httpJson<{
+    chain: { id: string; status: string }[];
+    events: { type: string }[];
+  }>(baseUrl, 'GET', `/commands/${newId}/chain`);
+  assert.equal(chain.status, 200);
+  assert.deepEqual(chain.body.chain.map((c) => c.id), [oldId, newId]);
+  assert.ok(chain.body.events.map((e) => e.type).includes('SUPERSEDED'));
+});

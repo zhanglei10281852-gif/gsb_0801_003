@@ -149,6 +149,14 @@ export class InMemoryRepository implements Repository {
     );
   }
 
+  findBySupersedesId(id: string): Command | null {
+    return (
+      [...this.commands.values()]
+        .filter((c) => c.supersedesId === id)
+        .sort((a, b) => a.createdAt - b.createdAt)[0] ?? null
+    );
+  }
+
   close(): void {
     /* nothing to release */
   }

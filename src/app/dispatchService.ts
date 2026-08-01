@@ -50,6 +50,17 @@ export interface SubmitInput {
   maxAttempts?: number;
   /** Production line; defaults to 'default' for single-line deployments. */
   lineId?: string;
+  /**
+   * When set, this submit is an explicit replacement: the referenced command is
+   * marked SUPERSEDED (if still active) in the SAME transaction, and this new
+   * command records `supersedesId`. If the referenced command is already
+   * terminal it is left untouched (a SUPERSEDE_NOTED audit event is emitted) and
+   * the replacement still proceeds — we never rewrite a persisted success.
+   */
+  supersedesId?: string;
+  /** Optional reason/actor recorded on the supersede audit event. */
+  supersedeReason?: string;
+  requestedBy?: string;
 }
 
 export interface SubmitResult {
@@ -125,10 +136,64 @@ export class DispatchService {
         now,
         maxAttempts,
         lineId,
+        supersedesId: input.supersedesId ?? null,
       });
       tx.insert(t.command);
       tx.appendEvents(t.events);
+
+      // Explicit replacement: atomically terminate the superseded command (if
+      // still active) in the same transaction, so a reader never sees two live
+      // commands for one intent. An already-terminal target is left untouched
+      // (SUPERSEDE_NOTED) — we never rewrite a persisted success/failure.
+      if (input.supersedesId) {
+        const old = tx.getById(input.supersedesId);
+        if (old) {
+          const st = sm.supersede(old, {
+            now,
+            bySupersessorId: t.command.id,
+            reason: input.supersedeReason,
+            requestedBy: input.requestedBy,
+          });
+          if (st.changed) tx.update(st.command);
+          tx.appendEvents(st.events);
+        }
+      }
+
       return { command: t.command, deduped: false };
+    });
+  }
+
+  /**
+   * Emergency recall of a not-yet-completed action. Marks the command CANCELLED
+   * if it is still PENDING/LEASED. If the command is already terminal the recall
+   * is REJECTED (never applied): a device-confirmed SUCCEEDED action cannot be
+   * turned into a fake "successful cancel". Returns whether it was cancelled and,
+   * if not, the rejection reason.
+   */
+  cancel(
+    commandId: string,
+    opts: { reason?: string; requestedBy?: string } = {},
+  ): { command: Command; cancelled: boolean; reason?: string } {
+    const now = this.clock.now();
+    return this.repo.transaction((tx) => {
+      const cmd = tx.getById(commandId);
+      if (!cmd) throw new NotFoundError(commandId);
+      const t = sm.cancel(cmd, {
+        now,
+        reason: opts.reason,
+        requestedBy: opts.requestedBy,
+      });
+      if (t.changed) tx.update(t.command);
+      tx.appendEvents(t.events);
+      if (t.outcome.kind === 'cancelled') {
+        return { command: t.command, cancelled: true };
+      }
+      return {
+        command: t.command,
+        cancelled: false,
+        reason:
+          t.outcome.kind === 'cancel_rejected' ? t.outcome.reason : 'unknown',
+      };
     });
   }
 
@@ -400,6 +465,52 @@ export class DispatchService {
 
   listOwnership(): LineOwnership[] {
     return this.repo.listOwnership();
+  }
+
+  /**
+   * Reconstruct the recall/replace lineage for a command as one causal chain:
+   * the ordered list of commands linked by `supersedesId` (walking backward to
+   * the original intent and forward through every replacement), plus every
+   * command-scoped event across the whole chain in global time order. This is
+   * how an operator answers "what replaced what, what was recalled, and which
+   * late receipts were rejected" for a single intent.
+   */
+  lineage(commandId: string): {
+    chain: Command[];
+    events: DomainEvent[];
+  } | null {
+    const start = this.repo.getById(commandId);
+    if (!start) return null;
+
+    // Walk backward to the root (the command that supersedes nothing).
+    let root = start;
+    const seen = new Set<string>([root.id]);
+    while (root.supersedesId) {
+      const prev = this.repo.getById(root.supersedesId);
+      if (!prev || seen.has(prev.id)) break; // missing or cycle guard
+      root = prev;
+      seen.add(prev.id);
+    }
+
+    // Walk forward following who-supersedes-me.
+    const chain: Command[] = [root];
+    let cur: Command | null = root;
+    const forwardSeen = new Set<string>([root.id]);
+    while (cur) {
+      const next: Command | null = this.repo.findBySupersedesId(cur.id);
+      if (!next || forwardSeen.has(next.id)) break;
+      chain.push(next);
+      forwardSeen.add(next.id);
+      cur = next;
+    }
+
+    // Merge each command's events, sorted by time then insertion (events are
+    // returned in insertion order per subject; a stable sort on `at` preserves it).
+    const events = chain
+      .flatMap((c) => this.repo.eventsFor(c.id))
+      .sort((a, b) => a.at - b.at);
+
+    return { chain, events };
   }
 }
 

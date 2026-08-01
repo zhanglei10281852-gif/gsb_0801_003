@@ -11,7 +11,9 @@ export type CommandStatus =
   | 'PENDING' // persisted, waiting for a gateway to lease it
   | 'LEASED' // a gateway holds a time-boxed lease and is (or will be) driving the device
   | 'SUCCEEDED' // a device confirmation of success has been persisted (terminal)
-  | 'FAILED'; // a device confirmation of failure, or retry exhaustion (terminal)
+  | 'FAILED' // a device confirmation of failure, or retry exhaustion (terminal)
+  | 'CANCELLED' // upstream emergency recall of a not-yet-completed action (terminal)
+  | 'SUPERSEDED'; // replaced by an explicit newer safety command (terminal)
 
 export type ConfirmOutcome = 'success' | 'failure';
 
@@ -71,7 +73,14 @@ export interface Command {
   readonly leaseExpiresAt: number | null; // epoch ms when the current lease dies
   readonly ownerGeneration: number | null; // ownership generation that leased it
 
-  readonly terminalReason: string | null; // why SUCCEEDED/FAILED (audit)
+  /**
+   * When this command was submitted as an explicit replacement for another, the
+   * id of the command it supersedes. Lets an operator walk the recall/replace
+   * lineage as one causal chain.
+   */
+  readonly supersedesId: string | null;
+
+  readonly terminalReason: string | null; // why SUCCEEDED/FAILED/CANCELLED/SUPERSEDED (audit)
 
   readonly createdAt: number;
   readonly updatedAt: number;
@@ -101,6 +110,10 @@ export type DomainEventType =
   | 'EXHAUSTED'
   | 'LEASE_FENCED' // lease attempt rejected: caller generation is stale
   | 'PREEMPTED' // in-flight command taken over by a newer generation
+  | 'CANCELLED' // upstream recalled a not-yet-completed action
+  | 'CANCEL_REJECTED' // recall refused: action already terminal (e.g. confirmed success)
+  | 'SUPERSEDED' // this command was replaced by a newer safety command
+  | 'SUPERSEDE_NOTED' // a supersede referenced an already-terminal command (no rewrite)
   // line-scoped ownership events:
   | 'OWNERSHIP_ACQUIRED' // first owner of a line (generation 1)
   | 'OWNERSHIP_RENEWED' // heartbeat extended current ownership lease
@@ -151,6 +164,10 @@ export type TransitionOutcome =
   | { kind: 'confirm_ignored'; reason: string }
   | { kind: 'expired_requeued' }
   | { kind: 'expired_failed' }
+  | { kind: 'cancelled' }
+  | { kind: 'cancel_rejected'; reason: string }
+  | { kind: 'superseded' }
+  | { kind: 'supersede_noted'; reason: string }
   | { kind: 'noop' };
 
 /** Result of an ownership (line-level) transition. */

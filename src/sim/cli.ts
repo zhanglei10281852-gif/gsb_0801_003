@@ -20,6 +20,12 @@
  *                    push a confirmation through (fenced by generation)
  *   ownership-expiry a standby is refused while the primary is healthy, then
  *                    allowed to take over once the primary's heartbeat lapses
+ *   emergency-cancel recall a not-yet-completed action; a late confirm can't revive it
+ *   cancel-after-success a confirmed action cannot be faked into a successful cancel
+ *   supersede        a safety command replaces an in-flight one; old -> SUPERSEDED;
+ *                    lineage links both as one causal chain
+ *   stale-gateway-after-supersede reconnecting old gateway is fenced; its supersede
+ *                    target is terminal and its late confirm is refused; device acts once
  *
  * The upstream idempotency key is time-seeded so repeated CLI runs against a
  * persistent DB do not collide.
@@ -79,6 +85,47 @@ async function getCommand(url: string, id: string) {
 
 async function forceSweep(url: string) {
   return httpJson<{ requeued: number; failed: number }>(url, 'POST', '/ops/sweep');
+}
+
+async function cancelCommand(url: string, id: string, reason?: string) {
+  return httpJson<{ cancelled: boolean; reason?: string; status: string }>(
+    url,
+    'POST',
+    `/commands/${encodeURIComponent(id)}/cancel`,
+    { reason, requestedBy: 'operator' },
+  );
+}
+
+async function supersede(
+  url: string,
+  key: string,
+  deviceId: string,
+  kind: string,
+  supersedesId: string,
+  lineId?: string,
+) {
+  return httpJson<{ command: { id: string; status: string }; deduped: boolean }>(
+    url,
+    'POST',
+    '/commands',
+    {
+      idempotencyKey: key,
+      deviceId,
+      kind,
+      params: {},
+      lineId,
+      supersedesId,
+      supersedeReason: 'safety_override',
+      requestedBy: 'operator',
+    },
+  );
+}
+
+async function getChain(url: string, id: string) {
+  return httpJson<{
+    chain: { id: string; status: string; supersedesId: string | null }[];
+    events: { type: string; commandId: string | null }[];
+  }>(url, 'GET', `/commands/${encodeURIComponent(id)}/chain`);
 }
 
 type Scenario = (args: Args) => Promise<boolean>;
@@ -406,6 +453,164 @@ const scenarios: Record<string, Scenario> = {
       hb.generation === own1.generation &&
       taken.outcome === 'takeover' &&
       taken.generation === own1.generation + 1;
+    log('PASS', ok);
+    return ok;
+  },
+
+  // --- round 3: emergency cancel + supersede ---
+
+  async 'emergency-cancel'(args) {
+    const stamp = Date.now();
+    const dev = `dev-cancel-${stamp}`;
+    const device = new SimDevice(dev);
+    process.stdout.write('[emergency-cancel] recall a PENDING action; a fenced late confirm cannot revive it\n');
+    const s = await submit(args.url, `cancel-${stamp}`, dev, 'calibrate');
+    const id = s.body.command.id;
+
+    const c = await cancelCommand(args.url, id, 'line_estop');
+    log('cancel result', c.body);
+
+    // A gateway that leased before the cancel tries a late confirm — must be ignored.
+    const gw = new SimGateway(args.url, 'gw-late', device);
+    const late = await gw.confirmRaw(id, 'lease_phantom', 'success', { receipt: 'r_late' });
+    log('late confirm after cancel', late);
+
+    const after = await getCommand(args.url, id);
+    const ok =
+      c.body.cancelled &&
+      after.body.command.status === 'CANCELLED' &&
+      !late.accepted;
+    log('final status', after.body.command.status);
+    log('PASS', ok);
+    return ok;
+  },
+
+  async 'cancel-after-success'(args) {
+    const stamp = Date.now();
+    const dev = `dev-cas-${stamp}`;
+    const device = new SimDevice(dev);
+    const gw = new SimGateway(args.url, 'gw-1', device);
+    process.stdout.write('[cancel-after-success] a confirmed action cannot be faked into a successful cancel\n');
+    const s = await submit(args.url, `cas-${stamp}`, dev, 'calibrate');
+    const id = s.body.command.id;
+
+    // Complete it for real first.
+    const handled = await gw.pumpOnce();
+    log('handled', { status: handled.confirmStatus, accepted: handled.confirmAccepted });
+
+    // Now try to recall it — must be REJECTED, status stays SUCCEEDED.
+    const c = await cancelCommand(args.url, id, 'too_late');
+    log('cancel-after-success result', c.body);
+
+    const after = await getCommand(args.url, id);
+    const ok =
+      !c.body.cancelled &&
+      c.body.reason === 'already_succeeded' &&
+      after.body.command.status === 'SUCCEEDED' &&
+      device.distinctActions === 1;
+    log('final status', after.body.command.status);
+    log('PASS', ok);
+    return ok;
+  },
+
+  async supersede(args) {
+    const stamp = Date.now();
+    const line = `line-sup-${stamp}`;
+    const dev = `dev-sup-${stamp}`;
+    const device = new SimDevice(dev);
+    const gw = new SimGateway(args.url, 'gw-1', device, line);
+    process.stdout.write('[supersede] a safety command replaces an in-flight one; old goes SUPERSEDED, chain links both\n');
+    await gw.acquireOwnership();
+
+    const oldCmd = await submit(args.url, `sup-old-${stamp}`, dev, 'switch_process', { profile: 'fast' }, line);
+    const oldId = oldCmd.body.command.id;
+
+    // Submit the explicit replacement (safe profile) that supersedes the old one.
+    const repl = await supersede(args.url, `sup-new-${stamp}`, dev, 'switch_process', oldId, line);
+    const newId = repl.body.command.id;
+    log('submitted replacement', { oldId, newId });
+
+    // Old must be SUPERSEDED; a gateway can only lease the replacement now.
+    const oldAfter = await getCommand(args.url, oldId);
+    const done = await gw.pumpOnce();
+    const newAfter = await getCommand(args.url, newId);
+
+    // The lineage stitches both commands + a SUPERSEDED event into one chain.
+    const chain = await getChain(args.url, newId);
+    const chainIds = chain.body.chain.map((c) => c.id);
+    const chainTypes = chain.body.events.map((e) => e.type);
+    log('chain', { ids: chainIds, hasSuperseded: chainTypes.includes('SUPERSEDED') });
+
+    const ok =
+      oldAfter.body.command.status === 'SUPERSEDED' &&
+      done.commandId === newId &&
+      newAfter.body.command.status === 'SUCCEEDED' &&
+      chainIds.length === 2 &&
+      chainIds[0] === oldId &&
+      chainIds[1] === newId &&
+      chainTypes.includes('SUPERSEDED') &&
+      device.distinctActions === 1;
+    log('final', { old: oldAfter.body.command.status, new: newAfter.body.command.status });
+    log('PASS', ok);
+    return ok;
+  },
+
+  async 'stale-gateway-after-supersede'(args) {
+    const stamp = Date.now();
+    const line = `line-sgs-${stamp}`;
+    const dev = `dev-sgs-${stamp}`;
+    const device = new SimDevice(dev);
+    const oldGw = new SimGateway(args.url, 'gw-old', device, line);
+    const newGw = new SimGateway(args.url, 'gw-new', device, line);
+    process.stdout.write('[stale-gateway-after-supersede] reconnecting old gateway is fenced; supersede + late confirm both refused\n');
+
+    // Old gateway owns the line (gen 1) and leases the original command.
+    await oldGw.acquireOwnership();
+    const oldCmd = await submit(args.url, `sgs-old-${stamp}`, dev, 'calibrate', {}, line);
+    const oldId = oldCmd.body.command.id;
+    const leased = await oldGw.pumpOnce({ dropConfirm: true }); // acts, confirm lost
+    const staleLeaseId = leased.leaseId!;
+    log('old gw leased + acted, confirm dropped', { distinctActions: device.distinctActions });
+
+    // Operator supersedes the original with a safety command while old gw is gone.
+    const repl = await supersede(args.url, `sgs-new-${stamp}`, dev, 'calibrate', oldId, line);
+    const newId = repl.body.command.id;
+    const oldAfter = await getCommand(args.url, oldId);
+    log('old superseded', { status: oldAfter.body.command.status });
+
+    // The standby takes over the line (needs the ownership TTL to lapse).
+    await sleep(args.leaseMs + 300);
+    const takeover = await newGw.acquireOwnership();
+    log('standby takeover', { outcome: takeover.outcome, generation: takeover.generation });
+
+    // Old gateway reconnects, still on generation 1, and tries to push its late
+    // confirm for the (now SUPERSEDED) command. Must be fenced/ignored.
+    oldGw.forceGeneration(1);
+    const late = await oldGw.confirmRaw(oldId, staleLeaseId, 'success', {
+      generation: 1,
+      receipt: 'r_old',
+    });
+    log('old gw late confirm (expect refused)', late);
+
+    // The replacement completes legitimately via the new owner.
+    await forceSweep(args.url);
+    const done = await newGw.pumpOnce();
+    const newAfter = await getCommand(args.url, newId);
+
+    const ok =
+      oldAfter.body.command.status === 'SUPERSEDED' &&
+      !late.accepted && // late confirm refused (stale generation and/or terminal)
+      newAfter.body.command.status === 'SUCCEEDED' &&
+      done.commandId === newId &&
+      // The old action (dropped) and the new safety action are DIFFERENT device
+      // actions with different executionIds; the device performs each at most
+      // once, so exactly two distinct actions total across the takeover.
+      device.distinctActions === 2;
+    log('final', {
+      old: oldAfter.body.command.status,
+      new: newAfter.body.command.status,
+      distinctActions: device.distinctActions,
+    });
     log('PASS', ok);
     return ok;
   },

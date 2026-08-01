@@ -6,10 +6,12 @@
  *
  * Routes:
  *   Upstream (scheduling system):
- *     POST /commands                 submit (idempotent by idempotencyKey; optional lineId)
+ *     POST /commands                 submit (idempotent by idempotencyKey; optional lineId, supersedesId)
+ *     POST /commands/:id/cancel      emergency recall of a not-yet-completed action
  *     GET  /commands/:id             query by internal id
  *     GET  /commands?key=...         query by idempotency key
  *     GET  /commands/:id/events      causal history of one command
+ *     GET  /commands/:id/chain       recall/replace lineage as one causal chain
  *   Gateway (edge, redundant):
  *     POST /gateway/ownership        { lineId, gateway } -> claim/heartbeat/takeover
  *     POST /gateway/lease            { leaseholder, lineId?, deviceId?, generation? } -> task or 204
@@ -126,6 +128,9 @@ async function handle(
       maxAttempts:
         typeof body.maxAttempts === 'number' ? body.maxAttempts : undefined,
       lineId: optStr(body.lineId),
+      supersedesId: optStr(body.supersedesId),
+      supersedeReason: optStr(body.supersedeReason),
+      requestedBy: optStr(body.requestedBy),
     });
     // 200 for dedup replay, 201 for a freshly created command.
     return send(res, result.deduped ? 200 : 201, {
@@ -256,14 +261,50 @@ async function handle(
     });
   }
 
-  // --- id-scoped routes: /commands/:id and /commands/:id/events ---
-  const cmdMatch = /^\/commands\/([^/]+)(\/events)?$/.exec(path);
+  // --- upstream: emergency recall of a not-yet-completed action ---
+  const cancelMatch = /^\/commands\/([^/]+)\/cancel$/.exec(path);
+  if (method === 'POST' && cancelMatch) {
+    const id = decodeURIComponent(cancelMatch[1]!);
+    const body = await readJson(req);
+    const result = service.cancel(id, {
+      reason: optStr(body.reason),
+      requestedBy: optStr(body.requestedBy),
+    });
+    // 200 when the recall took effect; 409 when it was refused (e.g. the action
+    // was already device-confirmed and cannot be faked into a cancel).
+    return send(res, result.cancelled ? 200 : 409, {
+      cancelled: result.cancelled,
+      reason: result.reason,
+      status: result.command.status,
+      terminalReason: result.command.terminalReason,
+    });
+  }
+
+  // --- id-scoped routes: /commands/:id, /commands/:id/events, /commands/:id/chain ---
+  const cmdMatch = /^\/commands\/([^/]+)(\/events|\/chain)?$/.exec(path);
   if (method === 'GET' && cmdMatch) {
     const id = decodeURIComponent(cmdMatch[1]!);
-    if (cmdMatch[2]) {
+    const suffix = cmdMatch[2];
+    if (suffix === '/events') {
       const cmd = service.getById(id);
       if (!cmd) return send(res, 404, { error: 'not_found', id });
       return send(res, 200, { commandId: id, events: service.history(id) });
+    }
+    if (suffix === '/chain') {
+      // Recall/replace lineage as one causal chain.
+      const lin = service.lineage(id);
+      if (!lin) return send(res, 404, { error: 'not_found', id });
+      return send(res, 200, {
+        commandId: id,
+        chain: lin.chain.map((c) => ({
+          id: c.id,
+          status: c.status,
+          supersedesId: c.supersedesId,
+          terminalReason: c.terminalReason,
+          kind: c.payload.kind,
+        })),
+        events: lin.events,
+      });
     }
     const cmd = service.getById(id);
     if (!cmd) return send(res, 404, { error: 'not_found', id });

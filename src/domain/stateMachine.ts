@@ -42,6 +42,7 @@ export interface CreateInput {
   now: number;
   maxAttempts: number;
   lineId?: string; // production line; defaults to 'default' for single-line use
+  supersedesId?: string | null; // id of the command this one explicitly replaces
 }
 
 function event(
@@ -65,7 +66,12 @@ function event(
 }
 
 function isTerminal(status: Command['status']): boolean {
-  return status === 'SUCCEEDED' || status === 'FAILED';
+  return (
+    status === 'SUCCEEDED' ||
+    status === 'FAILED' ||
+    status === 'CANCELLED' ||
+    status === 'SUPERSEDED'
+  );
 }
 
 function leaseIsLive(cmd: Command, now: number): boolean {
@@ -108,6 +114,7 @@ export function create(input: CreateInput): Transition {
     leaseholder: null,
     leaseExpiresAt: null,
     ownerGeneration: null,
+    supersedesId: input.supersedesId ?? null,
     terminalReason: null,
     createdAt: input.now,
     updatedAt: input.now,
@@ -124,6 +131,7 @@ export function create(input: CreateInput): Transition {
         deviceId: cmd.payload.deviceId,
         kind: cmd.payload.kind,
         maxAttempts: cmd.maxAttempts,
+        supersedesId: cmd.supersedesId,
       }),
     ],
   };
@@ -449,6 +457,131 @@ function confirmIgnored(
         reason,
         currentStatus: cmd.status,
         ...detail,
+      }),
+    ],
+  };
+}
+
+export interface CancelInput {
+  now: number;
+  reason?: string; // operator-supplied recall reason (audit)
+  requestedBy?: string; // who issued the recall (audit)
+}
+
+/**
+ * Emergency recall of a NOT-yet-completed action. Valid only when the command is
+ * PENDING or LEASED; the command becomes CANCELLED (terminal) and any lease is
+ * dropped so a late confirmation from the old holder is ignored.
+ *
+ * SAFETY: a cancel of an ALREADY-terminal command is REJECTED, never applied. In
+ * particular a device-confirmed SUCCEEDED action cannot be dressed up as a
+ * "successful cancel" — the physical action already happened, so the recall
+ * failed and the operator must be told (CANCEL_REJECTED with reason
+ * `already_succeeded`). This is the round-3 analogue of "success only on
+ * persisted confirmation".
+ */
+export function cancel(cmd: Command, input: CancelInput): Transition {
+  if (isTerminal(cmd.status)) {
+    const reason =
+      cmd.status === 'SUCCEEDED'
+        ? 'already_succeeded'
+        : cmd.status === 'FAILED'
+          ? 'already_failed'
+          : cmd.status === 'CANCELLED'
+            ? 'already_cancelled'
+            : 'already_superseded';
+    return {
+      command: cmd,
+      changed: false,
+      outcome: { kind: 'cancel_rejected', reason },
+      events: [
+        event(cmd.id, 'CANCEL_REJECTED', input.now, cmd.attemptEpoch, cmd.ownerGeneration, {
+          reason,
+          currentStatus: cmd.status,
+          requestedBy: input.requestedBy ?? null,
+        }),
+      ],
+    };
+  }
+
+  const cancelled: Command = {
+    ...cmd,
+    status: 'CANCELLED',
+    leaseId: null,
+    leaseholder: null,
+    leaseExpiresAt: null,
+    terminalReason: input.reason ? `cancelled:${input.reason}` : 'cancelled',
+    updatedAt: input.now,
+  };
+  return {
+    command: cancelled,
+    changed: true,
+    outcome: { kind: 'cancelled' },
+    events: [
+      event(cmd.id, 'CANCELLED', input.now, cmd.attemptEpoch, cmd.ownerGeneration, {
+        previousStatus: cmd.status,
+        previousLeaseholder: cmd.leaseholder,
+        reason: input.reason ?? null,
+        requestedBy: input.requestedBy ?? null,
+      }),
+    ],
+  };
+}
+
+export interface SupersedeInput {
+  now: number;
+  bySupersessorId: string; // id of the replacement command
+  reason?: string;
+  requestedBy?: string;
+}
+
+/**
+ * Mark a command as SUPERSEDED by an explicit newer safety command. Valid only
+ * when the OLD command is still active (PENDING/LEASED): it becomes SUPERSEDED
+ * (terminal) and its lease is dropped so a late confirmation is ignored.
+ *
+ * SAFETY: if the old command is ALREADY terminal (e.g. it was device-confirmed
+ * SUCCEEDED before the replacement arrived), it is left UNTOUCHED and a
+ * SUPERSEDE_NOTED audit event records the reference. We never rewrite a persisted
+ * success/failure into "superseded"; the replacement still proceeds on its own,
+ * and the lineage keeps both.
+ */
+export function supersede(cmd: Command, input: SupersedeInput): Transition {
+  if (isTerminal(cmd.status)) {
+    return {
+      command: cmd,
+      changed: false,
+      outcome: { kind: 'supersede_noted', reason: `already_${cmd.status.toLowerCase()}` },
+      events: [
+        event(cmd.id, 'SUPERSEDE_NOTED', input.now, cmd.attemptEpoch, cmd.ownerGeneration, {
+          bySupersessorId: input.bySupersessorId,
+          currentStatus: cmd.status,
+          requestedBy: input.requestedBy ?? null,
+        }),
+      ],
+    };
+  }
+
+  const superseded: Command = {
+    ...cmd,
+    status: 'SUPERSEDED',
+    leaseId: null,
+    leaseholder: null,
+    leaseExpiresAt: null,
+    terminalReason: input.reason ? `superseded:${input.reason}` : 'superseded',
+    updatedAt: input.now,
+  };
+  return {
+    command: superseded,
+    changed: true,
+    outcome: { kind: 'superseded' },
+    events: [
+      event(cmd.id, 'SUPERSEDED', input.now, cmd.attemptEpoch, cmd.ownerGeneration, {
+        previousStatus: cmd.status,
+        previousLeaseholder: cmd.leaseholder,
+        bySupersessorId: input.bySupersessorId,
+        reason: input.reason ?? null,
+        requestedBy: input.requestedBy ?? null,
       }),
     ],
   };
