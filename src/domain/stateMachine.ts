@@ -9,8 +9,14 @@ import {
   RenewInput,
   ReportDeliveryInput,
   SubmitCommandInput,
+  SupersedeInput,
+  WithdrawInput,
 } from "./types.js";
-import { InvalidLeaseError, InvalidStateTransitionError } from "./errors.js";
+import {
+  CommandAlreadyCompletedError,
+  InvalidLeaseError,
+  InvalidStateTransitionError,
+} from "./errors.js";
 
 export interface Decision {
   command: Command;
@@ -76,6 +82,8 @@ export function createPendingCommand(
     confirmationCode: null,
     deviceTimestamp: null,
     failureReason: null,
+    cancelReason: null,
+    supersededByCommandId: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -92,6 +100,7 @@ export function createPendingCommand(
         deviceId: input.payload.deviceId,
         action: input.payload.action,
         maxAttempts: command.maxAttempts,
+        replacesCommandId: input.payload.replacesCommandId ?? null,
       },
     },
   );
@@ -105,7 +114,12 @@ export function claimCommand(
   idGen: IdGenerator,
   clock: Clock,
 ): Decision {
-  if (command.status === "SUCCEEDED" || command.status === "FAILED") {
+  if (
+    command.status === "SUCCEEDED" ||
+    command.status === "FAILED" ||
+    command.status === "CANCELLED" ||
+    command.status === "SUPERSEDED"
+  ) {
     throw new InvalidStateTransitionError(
       command.commandId,
       command.status,
@@ -160,6 +174,8 @@ export function claimCommand(
       leaseExpiresAt: null,
       gatewayId: null,
       failureReason: `max attempts (${command.maxAttempts}) exhausted`,
+      cancelReason: null,
+      supersededByCommandId: null,
       updatedAt: now,
     };
     const failedEvent = createEvent(
@@ -343,19 +359,29 @@ export function confirmCommand(
     );
   }
 
-  if (command.status === "PENDING") {
+  if (
+    command.status === "PENDING" ||
+    command.status === "CANCELLED" ||
+    command.status === "SUPERSEDED"
+  ) {
+    const reason =
+      command.status === "CANCELLED"
+        ? "command was withdrawn; late confirmation rejected"
+        : command.status === "SUPERSEDED"
+          ? "command was superseded; late confirmation rejected"
+          : "command is PENDING (previous lease expired); late confirmation rejected";
     const staleEvent = createEvent(
       idGen,
       clock,
       command.commandId,
       "StaleMessageRejected",
-      "confirm-after-lease-expired",
+      "confirm-after-terminal",
       {
         leaseId: input.leaseId,
         gatewayId: input.gatewayId,
         payload: {
-          reason:
-            "command is PENDING (previous lease expired); late confirmation rejected",
+          reason,
+          finalStatus: command.status,
         },
       },
     );
@@ -543,6 +569,183 @@ export function isConfirmStale(
   if (command.leaseExpiresAt !== null && command.leaseExpiresAt <= now)
     return true;
   return false;
+}
+
+export function withdrawCommand(
+  command: Command,
+  input: WithdrawInput,
+  idGen: IdGenerator,
+  clock: Clock,
+): Decision {
+  if (command.status === "SUCCEEDED") {
+    throw new CommandAlreadyCompletedError(
+      command.commandId,
+      "SUCCEEDED",
+      "withdraw",
+    );
+  }
+  if (
+    command.status === "FAILED" ||
+    command.status === "CANCELLED" ||
+    command.status === "SUPERSEDED"
+  ) {
+    throw new CommandAlreadyCompletedError(
+      command.commandId,
+      command.status,
+      "withdraw",
+    );
+  }
+
+  const now = clock.now();
+  const oldLeaseId = command.currentLeaseId;
+  const oldGatewayId = command.gatewayId;
+
+  const cancelled: Command = {
+    ...command,
+    status: "CANCELLED",
+    currentLeaseId: null,
+    leaseExpiresAt: null,
+    gatewayId: null,
+    cancelReason: input.reason,
+    updatedAt: now,
+  };
+
+  const event = createEvent(
+    idGen,
+    clock,
+    command.commandId,
+    "CommandCancelled",
+    "withdraw",
+    {
+      leaseId: oldLeaseId,
+      attempt: command.attempt,
+      gatewayId: oldGatewayId,
+      payload: {
+        reason: input.reason,
+        requestedBy: input.requestedBy ?? null,
+        previousStatus: command.status,
+        invalidatedLeaseId: oldLeaseId,
+        invalidatedGatewayId: oldGatewayId,
+      },
+    },
+  );
+
+  return { command: cancelled, events: [event] };
+}
+
+export interface SupersedeDecision {
+  oldCommand: Command;
+  newCommand: Command;
+  events: CommandEvent[];
+}
+
+export function supersedeCommand(
+  oldCommand: Command,
+  input: SupersedeInput,
+  idGen: IdGenerator,
+  clock: Clock,
+): SupersedeDecision {
+  if (oldCommand.status === "SUCCEEDED") {
+    throw new CommandAlreadyCompletedError(
+      oldCommand.commandId,
+      "SUCCEEDED",
+      "supersede",
+    );
+  }
+  if (
+    oldCommand.status === "FAILED" ||
+    oldCommand.status === "CANCELLED" ||
+    oldCommand.status === "SUPERSEDED"
+  ) {
+    throw new CommandAlreadyCompletedError(
+      oldCommand.commandId,
+      oldCommand.status,
+      "supersede",
+    );
+  }
+
+  const now = clock.now();
+  const newCommandId = idGen.newId();
+  const oldLeaseId = oldCommand.currentLeaseId;
+  const oldGatewayId = oldCommand.gatewayId;
+
+  const superseded: Command = {
+    ...oldCommand,
+    status: "SUPERSEDED",
+    currentLeaseId: null,
+    leaseExpiresAt: null,
+    gatewayId: null,
+    supersededByCommandId: newCommandId,
+    updatedAt: now,
+  };
+
+  const newPayload = {
+    ...input.payload,
+    replacesCommandId: oldCommand.commandId,
+  };
+
+  const newCommand: Command = {
+    commandId: newCommandId,
+    idempotencyKey: input.idempotencyKey,
+    payload: newPayload,
+    status: "PENDING",
+    currentLeaseId: null,
+    attempt: 0,
+    maxAttempts: input.maxAttempts ?? oldCommand.maxAttempts,
+    leaseExpiresAt: null,
+    gatewayId: null,
+    confirmationCode: null,
+    deviceTimestamp: null,
+    failureReason: null,
+    cancelReason: null,
+    supersededByCommandId: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const supersededEvent = createEvent(
+    idGen,
+    clock,
+    oldCommand.commandId,
+    "CommandSuperseded",
+    "supersede",
+    {
+      leaseId: oldLeaseId,
+      attempt: oldCommand.attempt,
+      gatewayId: oldGatewayId,
+      payload: {
+        reason: input.reason,
+        requestedBy: input.requestedBy ?? null,
+        newCommandId,
+        previousStatus: oldCommand.status,
+        invalidatedLeaseId: oldLeaseId,
+        invalidatedGatewayId: oldGatewayId,
+      },
+    },
+  );
+
+  const submittedEvent = createEvent(
+    idGen,
+    clock,
+    newCommandId,
+    "CommandSubmitted",
+    "supersede-replacement",
+    {
+      payload: {
+        idempotencyKey: input.idempotencyKey,
+        deviceId: input.payload.deviceId,
+        action: input.payload.action,
+        maxAttempts: newCommand.maxAttempts,
+        replacesCommandId: oldCommand.commandId,
+      },
+    },
+  );
+
+  return {
+    oldCommand: superseded,
+    newCommand,
+    events: [supersededEvent, submittedEvent],
+  };
 }
 
 export interface RejectedOperationInput {

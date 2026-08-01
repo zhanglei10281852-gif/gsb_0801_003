@@ -7,6 +7,8 @@ import {
   RenewInput,
   ReportDeliveryInput,
   SubmitCommandInput,
+  SupersedeInput,
+  WithdrawInput,
 } from "../domain/types.js";
 import {
   claimCommand,
@@ -16,6 +18,8 @@ import {
   recordRejectedLeaseOperation,
   renewLease,
   reportDelivery,
+  supersedeCommand,
+  withdrawCommand,
   Clock,
   IdGenerator,
 } from "../domain/stateMachine.js";
@@ -171,6 +175,45 @@ export class CommandService {
       const accepted =
         decision.command.status === "SUCCEEDED" && before !== "SUCCEEDED";
       return { command: decision.command, accepted };
+    });
+  }
+
+  async withdraw(input: WithdrawInput): Promise<Command> {
+    return this.uow.transaction(async (tx) => {
+      const command = await tx.commands.findByCommandId(input.commandId);
+      if (!command) throw new CommandNotFoundError(input.commandId);
+      const decision = withdrawCommand(command, input, this.idGen, this.clock);
+      await tx.commands.save(decision.command, decision.events);
+      return decision.command;
+    });
+  }
+
+  async supersede(
+    input: SupersedeInput,
+  ): Promise<{ oldCommand: Command; newCommand: Command }> {
+    return this.uow.transaction(async (tx) => {
+      const oldCommand = await tx.commands.findByCommandId(input.oldCommandId);
+      if (!oldCommand) throw new CommandNotFoundError(input.oldCommandId);
+
+      const existing = await tx.commands.findByIdempotencyKey(
+        input.idempotencyKey,
+      );
+      if (existing) {
+        return { oldCommand, newCommand: existing };
+      }
+
+      const decision = supersedeCommand(
+        oldCommand,
+        input,
+        this.idGen,
+        this.clock,
+      );
+      await tx.commands.save(decision.oldCommand, [decision.events[0]]);
+      await tx.commands.save(decision.newCommand, [decision.events[1]]);
+      return {
+        oldCommand: decision.oldCommand,
+        newCommand: decision.newCommand,
+      };
     });
   }
 

@@ -60,26 +60,35 @@ src/
 
 ```
 PENDING ──claim──▶ CLAIMED(leaseId, attempt)
-  ▲                  │
-  │                  ├── renew ──▶ CLAIMED(延长租约)
-  │                  ├── reportDelivery ──▶ CLAIMED(仅记录事件)
-  │                  ├── confirm(有效租约) ──▶ SUCCEEDED  (终态)
-  │                  └── leaseExpired ──┐
-  │                                     ├─ 尝试次数未到上限 ──▶ PENDING
-  │                                     └─ 尝试次数已到上限 ──▶ FAILED (终态)
-  └── claim(收割过期租约) ──▶ CLAIMED(新 leaseId, attempt++)
+  │  ▲                │
+  │  │                ├── renew ──▶ CLAIMED(延长租约)
+  │  │                ├── reportDelivery ──▶ CLAIMED(仅记录事件)
+  │  │                ├── confirm(有效租约) ──▶ SUCCEEDED  (终态)
+  │  │                ├── withdraw ──▶ CANCELLED (终态)
+  │  │                ├── supersede ──▶ SUPERSEDED (终态) + 新 PENDING 指令
+  │  │                └── leaseExpired ──┐
+  │  │                                   ├─ 尝试次数未到上限 ──▶ PENDING
+  │  │                                   └─ 尝试次数已到上限 ──▶ FAILED (终态)
+  │  └── claim(收割过期租约) ──▶ CLAIMED(新 leaseId, attempt++)
+  ├── withdraw ──▶ CANCELLED (终态)
+  └── supersede ──▶ SUPERSEDED (终态) + 新 PENDING 指令
 ```
+
+终态：`SUCCEEDED`、`FAILED`、`CANCELLED`、`SUPERSEDED`。终态命令不可被领取、撤回或取代。
 
 关键规则：
 
 - **稳定执行身份**：重试和重新领取始终沿用同一个 `commandId`，只递增 `attempt` 并换发新的 `leaseId`。
 - **只有持久化的设备确认能成功**：`confirm` 在单个 SQLite 事务中同时写入 `DeviceConfirmed` + `CommandSucceeded` 事件并更新状态；事务未提交则状态不变。
-- **过期任务不会被迟到消息复活**：确认必须携带当前有效的 `leaseId` 且租约未过期；旧租约、过期租约、已成功/已失败命令的迟到确认一律产生 `StaleMessageRejected` 事件但不改变最终状态。
+- **已确认的动作不能伪装成撤回/取代**：对 `SUCCEEDED` 命令的 withdraw/supersede 返回 409 `COMMAND_ALREADY_COMPLETED`，不改变状态和确认码。
+- **过期任务不会被迟到消息复活**：确认必须携带当前有效的 `leaseId` 且租约未过期；旧租约、过期租约、已成功/已失败/已撤回/已取代命令的迟到确认一律产生 `StaleMessageRejected` 事件但不改变最终状态。
+- **紧急撤回**：`withdraw` 将 PENDING/CLAIMED 命令置为 `CANCELLED`，作废当前租约；旧网关后续续约/确认被拒并审计。
+- **替代指令**：`supersede` 将旧命令置为 `SUPERSEDED` 并原子创建一条新 PENDING 命令（`payload.replacesCommandId` 指向旧命令），旧命令的 `supersededByCommandId` 指向新命令；新旧命令通过因果链可查询。
 - **因果事件日志**：每次状态变化都产生带 `causedBy`、`leaseId`、`attempt`、`gatewayId`、`timestamp` 的事件，而非只保存最终值。
 
 ### 事件类型
 
-`CommandSubmitted` · `CommandClaimed` · `CommandReclaimed` · `LeaseRenewed` · `DeliveryReported` · `DeviceConfirmed` · `CommandSucceeded` · `LeaseExpired` · `CommandFailed` · `LeaseOperationRejected` · `StaleMessageRejected`
+`CommandSubmitted` · `CommandClaimed` · `CommandReclaimed` · `LeaseRenewed` · `DeliveryReported` · `DeviceConfirmed` · `CommandSucceeded` · `LeaseExpired` · `CommandFailed` · `CommandCancelled` · `CommandSuperseded` · `LeaseOperationRejected` · `StaleMessageRejected`
 
 ### 所有权代际（HA fencing）
 
@@ -101,13 +110,15 @@ PENDING ──claim──▶ CLAIMED(leaseId, attempt)
 
 ### 上游（调度系统）
 
-| 方法 | 路径                    | 说明                                                                                                                          |
-| ---- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| POST | `/commands`             | 提交指令。必须带 `Idempotency-Key` 请求头；body 含 `payload`、可选 `maxAttempts`。首次返回 201，重复幂等键返回 200 + 同一命令 |
-| GET  | `/commands/:id`         | 按 commandId 查询状态                                                                                                         |
-| GET  | `/commands/by-key/:key` | 按幂等键查询状态                                                                                                              |
-| GET  | `/commands/:id/events`  | 查询该命令的完整因果事件链                                                                                                    |
-| GET  | `/commands`             | 列出近期命令                                                                                                                  |
+| 方法 | 路径                      | 说明                                                                                                                                                                                                        |
+| ---- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST | `/commands`               | 提交指令。必须带 `Idempotency-Key` 请求头；body 含 `payload`、可选 `maxAttempts`。首次返回 201，重复幂等键返回 200 + 同一命令                                                                               |
+| GET  | `/commands/:id`           | 按 commandId 查询状态                                                                                                                                                                                       |
+| GET  | `/commands/by-key/:key`   | 按幂等键查询状态                                                                                                                                                                                            |
+| GET  | `/commands/:id/events`    | 查询该命令的完整因果事件链                                                                                                                                                                                  |
+| GET  | `/commands`               | 列出近期命令                                                                                                                                                                                                |
+| POST | `/commands/:id/withdraw`  | 紧急撤回。body：`reason`、可选 `requestedBy`。仅 PENDING/CLAIMED 可撤回；SUCCEEDED 返回 409。作废当前租约                                                                                                   |
+| POST | `/commands/:id/supersede` | 提交替代指令。必须带 `Idempotency-Key`（新指令的幂等键）；body：`payload`、`reason`、可选 `maxAttempts`。旧命令置 SUPERSEDED，原子创建新 PENDING 命令；SUCCEEDED 返回 409。返回 `oldCommand` + `newCommand` |
 
 ### 网关
 
@@ -130,21 +141,23 @@ PENDING ──claim──▶ CLAIMED(leaseId, attempt)
 
 ## 交付保证
 
-以下保证由自动化测试（35 个单元测试 + 13 个端到端场景）覆盖：
+以下保证由自动化测试（45 个单元测试 + 19 个端到端场景）覆盖：
 
 1. **幂等提交**：相同 `Idempotency-Key` 的并发或重复提交只生成一个 `commandId`，即"持久化后、返回响应前崩溃"的场景——上游重试拿到的是同一条命令，不会变成两个设备动作。
-2. **稳定执行身份**：网关失联后租约过期，重新领取沿用原 `commandId`，只产生新的 `leaseId` 和递增的代际号 `attempt`。主备接管、进程重启均不改变执行身份。
+2. **稳定执行身份**：网关失联后租约过期，重新领取沿用原 `commandId`，只产生新的 `leaseId` 和递增的代际号 `attempt`。主备接管、进程重启均不改变执行身份。替代指令获得新 `commandId`，但通过 `replacesCommandId` 链接到旧指令。
 3. **设备确认持久化才标成功**：`DeviceConfirmed` 事件和 `SUCCEEDED` 状态在同一事务中落盘；未提交的确认在崩溃后不存在。
 4. **迟到确认不能复活过期任务**：
    - 旧 `leaseId` 的确认（网关被重新领取后）→ 拒绝；
    - 租约已过期的确认 → 拒绝；
-   - 已 `SUCCEEDED` 后的重复确认 → 幂等返回成功但记录 `StaleMessageRejected`；
+   - 已 `SUCCEEDED`/`CANCELLED`/`SUPERSEDED` 后的迟到确认 → 记录 `StaleMessageRejected`，状态不推进；
    - 已 `FAILED` 后的确认 → 拒绝。
 5. **最大尝试次数**：超过 `maxAttempts` 后命令进入 `FAILED` 终态，不再被领取。
-6. **因果可追溯**：每次投递、续约、过期、重试、拒绝都有带因果说明（`causedBy`）的事件记录，事件按插入顺序排列。
+6. **因果可追溯**：每次投递、续约、过期、重试、拒绝、撤回、取代都有带因果说明（`causedBy`）的事件记录，事件按插入顺序排列。撤回/取代产生的因果链可通过 `GET /commands/:id/events` 查询，新旧命令通过 `replacesCommandId`/`supersededByCommandId` 双向关联。
 7. **网关断网恢复**：网关离线期间停止续约，租约到期后任务可被其他网关领取；离线网关缓冲的确认在恢复后若租约已失效会被拒绝。
 8. **双网关 HA fencing**：主备网关场景下，备用网关在主网关租约过期后接管并获得新代际；旧代际的续约、投递上报、确认全部被拒并写入 `LeaseOperationRejected` 审计事件；并发争抢由 SQLite 写事务串行化，只有一个网关赢得代际。
-9. **进程重启恢复**：服务进程重启后，SQLite 中处于 `CLAIMED` 状态的任务及其租约完整保留；租约到期后备用网关可接管，`commandId` 和代际号不变。
+9. **进程重启恢复**：服务进程重启后，SQLite 中处于 `CLAIMED` 状态的任务及其租约完整保留；`CANCELLED`/`SUPERSEDED` 状态也持久化；租约到期后备用网关可接管，`commandId` 和代际号不变。
+10. **紧急撤回**：PENDING/CLAIMED 命令可被撤回为 `CANCELLED`，当前租约作废，旧网关后续续约/确认被拒并审计。已 `SUCCEEDED` 的命令不能撤回（返回 409），防止把已执行动作伪装成撤回。
+11. **替代指令**：PENDING/CLAIMED 命令可被一条新安全指令取代为 `SUPERSEDED`，新命令原子创建为 PENDING 并链接到旧命令；旧网关的迟到确认被拒。已 `SUCCEEDED` 的命令不能被取代。
 
 ---
 
@@ -173,6 +186,10 @@ PENDING ──claim──▶ CLAIMED(leaseId, attempt)
 | 服务进程重启                          | SQLite（WAL + `synchronous=FULL`）保证已提交事务不丢；`CLAIMED` 状态及租约完整保留，后台扫描器启动后自动回收过期租约 |
 | 服务进程在**租约有效期内重启**        | 重启后任务仍为 `CLAIMED`，持有原 `leaseId` 和代际号；旧网关若在租约到期前沿约仍被接受，租约到期后备用网关可接管      |
 | 主网关**租约到期、备用网关接管**      | 代际号 +1，新 `leaseId` 下发；旧代际的续约/上报/确认全部被拒并记录 `LeaseOperationRejected`，`commandId` 不变        |
+| 上游**撤回 PENDING/CLAIMED 命令**     | 命令置为 `CANCELLED`，当前租约作废；旧网关续约/确认被拒并审计；已撤回命令不可被领取                                  |
+| 上游**提交替代指令**                  | 旧命令置为 `SUPERSEDED` 并链接到新命令，新命令原子创建为 `PENDING`；旧网关迟到确认被拒；新旧命令因果链可查询         |
+| **撤回/取代已成功的命令**             | 返回 409 `COMMAND_ALREADY_COMPLETED`，状态和确认码不变——已执行动作不能被伪装成撤回或取代                             |
+| 服务在**撤回/取代事务提交后崩溃**     | SQLite 保证 `CANCELLED`/`SUPERSEDED` 状态和事件持久化；重启后旧网关的迟到操作仍被 fencing                            |
 | SQLite 文件损坏                       | 不在恢复范围内；建议通过文件系统快照/备份保护                                                                        |
 
 ---
@@ -198,7 +215,13 @@ PENDING ──claim──▶ CLAIMED(leaseId, attempt)
 10. **Split-brain**：旧网关在接管后继续写入，全部 fencing，无僵尸成功
 11. **接管审计因果链**：事件链还原代际转换的完整因果关系
 12. **进程重启恢复**：租约期内重启服务，状态从 SQLite 恢复，到期后备用网关接管
-13. 运维审计事件完整性
+13. **撤回 PENDING**：命令置 CANCELLED，不可被领取，事件链可查询
+14. **撤回 CLAIMED**：租约作废，旧网关续约/确认被拒并审计
+15. **撤回已成功**：409 拒绝，已执行动作不能伪装成撤回
+16. **替代指令**：旧命令 SUPERSEDED + 新命令投递成功，双向链接，因果链可查询
+17. **取代已成功**：409 拒绝
+18. **崩溃恢复 + 取代**：取代后重启服务，状态持久化，旧网关迟到确认被拒，替代指令继续执行
+19. 运维审计事件完整性
 
 独立运行模拟器：
 

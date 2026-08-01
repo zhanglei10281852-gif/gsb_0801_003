@@ -1,26 +1,27 @@
-import { Router, Request, Response, NextFunction } from 'express';
-import { CommandService } from '../application/commandService.js';
+import { Router, Request, Response, NextFunction } from "express";
+import { CommandService } from "../application/commandService.js";
 import {
+  CommandAlreadyCompletedError,
   CommandNotFoundError,
   DomainError,
   InvalidLeaseError,
   InvalidStateTransitionError,
   NoClaimableTaskError,
-} from '../domain/errors.js';
-import { CommandPayload } from '../domain/types.js';
+} from "../domain/errors.js";
+import { CommandPayload } from "../domain/types.js";
 
 export function createRouter(service: CommandService): Router {
   const router = Router();
 
-  router.get('/health', (_req, res) => {
-    res.json({ status: 'ok', timestamp: Date.now() });
+  router.get("/health", (_req, res) => {
+    res.json({ status: "ok", timestamp: Date.now() });
   });
 
-  router.post('/commands', async (req, res, next) => {
+  router.post("/commands", async (req, res, next) => {
     try {
-      const idempotencyKey = req.header('Idempotency-Key');
+      const idempotencyKey = req.header("Idempotency-Key");
       if (!idempotencyKey) {
-        res.status(400).json({ error: 'Idempotency-Key header is required' });
+        res.status(400).json({ error: "Idempotency-Key header is required" });
         return;
       }
       const body = req.body as {
@@ -30,7 +31,7 @@ export function createRouter(service: CommandService): Router {
       if (!body.payload || !body.payload.deviceId || !body.payload.action) {
         res
           .status(400)
-          .json({ error: 'payload.deviceId and payload.action are required' });
+          .json({ error: "payload.deviceId and payload.action are required" });
         return;
       }
       const { command, created } = await service.submit({
@@ -44,11 +45,11 @@ export function createRouter(service: CommandService): Router {
     }
   });
 
-  router.get('/commands/:id', async (req, res, next) => {
+  router.get("/commands/:id", async (req, res, next) => {
     try {
       const command = await service.getCommand(req.params.id);
       if (!command) {
-        res.status(404).json({ error: 'command not found' });
+        res.status(404).json({ error: "command not found" });
         return;
       }
       res.json(serializeCommand(command));
@@ -57,11 +58,11 @@ export function createRouter(service: CommandService): Router {
     }
   });
 
-  router.get('/commands/by-key/:key', async (req, res, next) => {
+  router.get("/commands/by-key/:key", async (req, res, next) => {
     try {
       const command = await service.getCommandByIdempotencyKey(req.params.key);
       if (!command) {
-        res.status(404).json({ error: 'command not found' });
+        res.status(404).json({ error: "command not found" });
         return;
       }
       res.json(serializeCommand(command));
@@ -70,7 +71,7 @@ export function createRouter(service: CommandService): Router {
     }
   });
 
-  router.get('/commands/:id/events', async (req, res, next) => {
+  router.get("/commands/:id/events", async (req, res, next) => {
     try {
       const events = await service.getEvents(req.params.id);
       res.json({ events: events.map(serializeEvent) });
@@ -79,7 +80,7 @@ export function createRouter(service: CommandService): Router {
     }
   });
 
-  router.get('/commands', async (req, res, next) => {
+  router.get("/commands", async (req, res, next) => {
     try {
       const limit = Math.min(Number(req.query.limit) || 100, 1000);
       const events = await service.getAllEvents(limit);
@@ -95,11 +96,76 @@ export function createRouter(service: CommandService): Router {
     }
   });
 
-  router.post('/gateway/claim', async (req, res, next) => {
+  router.post("/commands/:id/withdraw", async (req, res, next) => {
     try {
-      const body = req.body as { gatewayId?: string; leaseDurationMs?: number; deviceId?: string };
+      const body = req.body as { reason?: string; requestedBy?: string };
+      if (!body.reason) {
+        res.status(400).json({ error: "reason is required" });
+        return;
+      }
+      const command = await service.withdraw({
+        commandId: req.params.id,
+        reason: body.reason,
+        requestedBy: body.requestedBy,
+      });
+      res.json(serializeCommand(command));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post("/commands/:id/supersede", async (req, res, next) => {
+    try {
+      const idempotencyKey = req.header("Idempotency-Key");
+      if (!idempotencyKey) {
+        res.status(400).json({
+          error:
+            "Idempotency-Key header is required for the replacement command",
+        });
+        return;
+      }
+      const body = req.body as {
+        payload?: CommandPayload;
+        reason?: string;
+        requestedBy?: string;
+        maxAttempts?: number;
+      };
+      if (!body.payload || !body.payload.deviceId || !body.payload.action) {
+        res
+          .status(400)
+          .json({ error: "payload.deviceId and payload.action are required" });
+        return;
+      }
+      if (!body.reason) {
+        res.status(400).json({ error: "reason is required" });
+        return;
+      }
+      const { oldCommand, newCommand } = await service.supersede({
+        oldCommandId: req.params.id,
+        idempotencyKey,
+        payload: body.payload,
+        reason: body.reason,
+        requestedBy: body.requestedBy,
+        maxAttempts: body.maxAttempts,
+      });
+      res.status(201).json({
+        oldCommand: serializeCommand(oldCommand),
+        newCommand: serializeCommand(newCommand),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post("/gateway/claim", async (req, res, next) => {
+    try {
+      const body = req.body as {
+        gatewayId?: string;
+        leaseDurationMs?: number;
+        deviceId?: string;
+      };
       if (!body.gatewayId) {
-        res.status(400).json({ error: 'gatewayId is required' });
+        res.status(400).json({ error: "gatewayId is required" });
         return;
       }
       const leaseDurationMs = body.leaseDurationMs ?? 30000;
@@ -114,7 +180,7 @@ export function createRouter(service: CommandService): Router {
     }
   });
 
-  router.post('/gateway/renew', async (req, res, next) => {
+  router.post("/gateway/renew", async (req, res, next) => {
     try {
       const body = req.body as {
         commandId?: string;
@@ -125,7 +191,7 @@ export function createRouter(service: CommandService): Router {
       if (!body.commandId || !body.leaseId || !body.gatewayId) {
         res
           .status(400)
-          .json({ error: 'commandId, leaseId, gatewayId are required' });
+          .json({ error: "commandId, leaseId, gatewayId are required" });
         return;
       }
       const command = await service.renew({
@@ -140,7 +206,7 @@ export function createRouter(service: CommandService): Router {
     }
   });
 
-  router.post('/gateway/report-delivery', async (req, res, next) => {
+  router.post("/gateway/report-delivery", async (req, res, next) => {
     try {
       const body = req.body as {
         commandId?: string;
@@ -151,7 +217,7 @@ export function createRouter(service: CommandService): Router {
       if (!body.commandId || !body.leaseId || !body.gatewayId) {
         res
           .status(400)
-          .json({ error: 'commandId, leaseId, gatewayId are required' });
+          .json({ error: "commandId, leaseId, gatewayId are required" });
         return;
       }
       const command = await service.reportDelivery({
@@ -166,7 +232,7 @@ export function createRouter(service: CommandService): Router {
     }
   });
 
-  router.post('/gateway/confirm', async (req, res, next) => {
+  router.post("/gateway/confirm", async (req, res, next) => {
     try {
       const body = req.body as {
         commandId?: string;
@@ -182,8 +248,7 @@ export function createRouter(service: CommandService): Router {
         !body.confirmationCode
       ) {
         res.status(400).json({
-          error:
-            'commandId, leaseId, gatewayId, confirmationCode are required',
+          error: "commandId, leaseId, gatewayId, confirmationCode are required",
         });
         return;
       }
@@ -200,7 +265,7 @@ export function createRouter(service: CommandService): Router {
     }
   });
 
-  router.get('/events', async (_req, res, next) => {
+  router.get("/events", async (_req, res, next) => {
     try {
       const events = await service.getAllEvents(500);
       res.json({ events: events.map(serializeEvent) });
@@ -209,7 +274,7 @@ export function createRouter(service: CommandService): Router {
     }
   });
 
-  router.post('/admin/scan-expired', async (_req, res, next) => {
+  router.post("/admin/scan-expired", async (_req, res, next) => {
     try {
       const results = await service.scanExpiredLeases(100);
       res.json({ expired: results });
@@ -236,6 +301,14 @@ export function createRouter(service: CommandService): Router {
         });
         return;
       }
+      if (err instanceof CommandAlreadyCompletedError) {
+        res.status(409).json({
+          error: err.message,
+          code: err.code,
+          details: err.details,
+        });
+        return;
+      }
       if (err instanceof InvalidStateTransitionError) {
         res.status(409).json({
           error: err.message,
@@ -248,9 +321,9 @@ export function createRouter(service: CommandService): Router {
         res.status(400).json({ error: err.message, code: err.code });
         return;
       }
-      const message = err instanceof Error ? err.message : 'unknown error';
-      res.status(500).json({ error: 'internal server error', detail: message });
-    }
+      const message = err instanceof Error ? err.message : "unknown error";
+      res.status(500).json({ error: "internal server error", detail: message });
+    },
   );
 
   return router;
@@ -269,6 +342,8 @@ function serializeCommand(c: {
   confirmationCode: string | null;
   deviceTimestamp: number | null;
   failureReason: string | null;
+  cancelReason: string | null;
+  supersededByCommandId: string | null;
   createdAt: number;
   updatedAt: number;
 }) {
@@ -285,6 +360,8 @@ function serializeCommand(c: {
     confirmationCode: c.confirmationCode,
     deviceTimestamp: c.deviceTimestamp,
     failureReason: c.failureReason,
+    cancelReason: c.cancelReason,
+    supersededByCommandId: c.supersededByCommandId,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };

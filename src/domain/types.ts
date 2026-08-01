@@ -1,9 +1,16 @@
-export type CommandStatus = "PENDING" | "CLAIMED" | "SUCCEEDED" | "FAILED";
+export type CommandStatus =
+  | "PENDING"
+  | "CLAIMED"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "CANCELLED"
+  | "SUPERSEDED";
 
 export interface CommandPayload {
   deviceId: string;
   action: string;
   params?: Record<string, unknown>;
+  replacesCommandId?: string;
 }
 
 export interface Command {
@@ -19,6 +26,8 @@ export interface Command {
   confirmationCode: string | null;
   deviceTimestamp: number | null;
   failureReason: string | null;
+  cancelReason: string | null;
+  supersededByCommandId: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -33,6 +42,8 @@ export type EventType =
   | "LeaseExpired"
   | "CommandReclaimed"
   | "CommandFailed"
+  | "CommandCancelled"
+  | "CommandSuperseded"
   | "LeaseOperationRejected"
   | "StaleMessageRejected";
 
@@ -80,6 +91,21 @@ export interface ConfirmInput {
   gatewayId: string;
   confirmationCode: string;
   deviceTimestamp: number;
+}
+
+export interface WithdrawInput {
+  commandId: string;
+  reason: string;
+  requestedBy?: string;
+}
+
+export interface SupersedeInput {
+  oldCommandId: string;
+  idempotencyKey: string;
+  payload: CommandPayload;
+  reason: string;
+  requestedBy?: string;
+  maxAttempts?: number;
 }
 
 export interface ExpireResult {

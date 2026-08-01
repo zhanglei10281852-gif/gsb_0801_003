@@ -7,10 +7,13 @@ import {
   recordRejectedLeaseOperation,
   renewLease,
   reportDelivery,
+  supersedeCommand,
+  withdrawCommand,
   Clock,
   IdGenerator,
 } from "../../src/domain/stateMachine.js";
 import {
+  CommandAlreadyCompletedError,
   InvalidLeaseError,
   InvalidStateTransitionError,
 } from "../../src/domain/errors.js";
@@ -325,7 +328,7 @@ describe("state machine — device confirmation", () => {
     );
     expect(stale.command.status).toBe("PENDING");
     expect(stale.events[0].eventType).toBe("StaleMessageRejected");
-    expect(stale.events[0].causedBy).toBe("confirm-after-lease-expired");
+    expect(stale.events[0].causedBy).toBe("confirm-after-terminal");
   });
 });
 
@@ -659,5 +662,322 @@ describe("state machine — ownership generation (HA fencing)", () => {
     expect(staleConfirm.command.confirmationCode).toBeNull();
     expect(staleConfirm.events[0].eventType).toBe("StaleMessageRejected");
     expect(staleConfirm.events[0].causedBy).toBe("confirm-stale-lease");
+  });
+});
+
+describe("state machine — emergency withdraw", () => {
+  it("withdraws a PENDING command and emits CommandCancelled", () => {
+    const { clock, idGen, command } = setup();
+    const result = withdrawCommand(
+      command,
+      {
+        commandId: command.commandId,
+        reason: "safety stop",
+        requestedBy: "operator",
+      },
+      idGen,
+      clock,
+    );
+    expect(result.command.status).toBe("CANCELLED");
+    expect(result.command.cancelReason).toBe("safety stop");
+    expect(result.command.currentLeaseId).toBeNull();
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0].eventType).toBe("CommandCancelled");
+    expect(result.events[0].causedBy).toBe("withdraw");
+    expect(result.events[0].payload).toMatchObject({
+      reason: "safety stop",
+      requestedBy: "operator",
+      previousStatus: "PENDING",
+    });
+  });
+
+  it("withdraws a CLAIMED command and invalidates the lease", () => {
+    const { clock, idGen, command } = setup();
+    const claimed = claimCommand(
+      command,
+      { gatewayId: "gw-1", leaseDurationMs: 5000 },
+      idGen,
+      clock,
+    );
+    const oldLease = claimed.command.currentLeaseId;
+    const result = withdrawCommand(
+      claimed.command,
+      { commandId: command.commandId, reason: "abort" },
+      idGen,
+      clock,
+    );
+    expect(result.command.status).toBe("CANCELLED");
+    expect(result.command.currentLeaseId).toBeNull();
+    expect(result.command.gatewayId).toBeNull();
+    expect(result.events[0].payload).toMatchObject({
+      invalidatedLeaseId: oldLease,
+      invalidatedGatewayId: "gw-1",
+      previousStatus: "CLAIMED",
+    });
+  });
+
+  it("rejects withdraw of a SUCCEEDED command (cannot fake undo of executed action)", () => {
+    const { clock, idGen, command } = setup();
+    const claimed = claimCommand(
+      command,
+      { gatewayId: "gw-1", leaseDurationMs: 5000 },
+      idGen,
+      clock,
+    );
+    const succeeded = confirmCommand(
+      claimed.command,
+      {
+        commandId: claimed.command.commandId,
+        leaseId: claimed.command.currentLeaseId!,
+        gatewayId: "gw-1",
+        confirmationCode: "ACK",
+        deviceTimestamp: clock.now(),
+      },
+      idGen,
+      clock,
+    );
+    expect(() =>
+      withdrawCommand(
+        succeeded.command,
+        { commandId: command.commandId, reason: "too late" },
+        idGen,
+        clock,
+      ),
+    ).toThrow(CommandAlreadyCompletedError);
+  });
+
+  it("rejects withdraw of already terminal states", () => {
+    const { clock, idGen, command } = setup();
+    const claimed = claimCommand(
+      command,
+      { gatewayId: "gw-1", leaseDurationMs: 500 },
+      idGen,
+      clock,
+    );
+    const withdrawn = withdrawCommand(
+      claimed.command,
+      { commandId: command.commandId, reason: "stop" },
+      idGen,
+      clock,
+    );
+    expect(() =>
+      withdrawCommand(
+        withdrawn.command,
+        { commandId: command.commandId, reason: "again" },
+        idGen,
+        clock,
+      ),
+    ).toThrow(CommandAlreadyCompletedError);
+  });
+
+  it("late confirmation after withdraw is rejected without advancing state", () => {
+    const { clock, idGen, command } = setup();
+    const claimed = claimCommand(
+      command,
+      { gatewayId: "gw-1", leaseDurationMs: 5000 },
+      idGen,
+      clock,
+    );
+    const leaseId = claimed.command.currentLeaseId!;
+    const withdrawn = withdrawCommand(
+      claimed.command,
+      { commandId: command.commandId, reason: "abort" },
+      idGen,
+      clock,
+    );
+    const lateConfirm = confirmCommand(
+      withdrawn.command,
+      {
+        commandId: command.commandId,
+        leaseId,
+        gatewayId: "gw-1",
+        confirmationCode: "LATE",
+        deviceTimestamp: clock.now(),
+      },
+      idGen,
+      clock,
+    );
+    expect(lateConfirm.command.status).toBe("CANCELLED");
+    expect(lateConfirm.command.confirmationCode).toBeNull();
+    expect(lateConfirm.events[0].eventType).toBe("StaleMessageRejected");
+    expect(lateConfirm.events[0].payload).toMatchObject({
+      finalStatus: "CANCELLED",
+    });
+  });
+});
+
+describe("state machine — supersede (replacement command)", () => {
+  it("supersedes a PENDING command, creates new PENDING command with replacesCommandId", () => {
+    const clock = new FakeClock();
+    const idGen = new FakeIdGen();
+    const submitted = createPendingCommand(makeSubmit(), null, idGen, clock);
+    clock.advance(10);
+    const result = supersedeCommand(
+      submitted.command,
+      {
+        oldCommandId: submitted.command.commandId,
+        idempotencyKey: "replacement-key",
+        payload: { deviceId: "dev-1", action: "emergency-stop" },
+        reason: "safety override",
+      },
+      idGen,
+      clock,
+    );
+    expect(result.oldCommand.status).toBe("SUPERSEDED");
+    expect(result.oldCommand.supersededByCommandId).toBe(
+      result.newCommand.commandId,
+    );
+    expect(result.newCommand.status).toBe("PENDING");
+    expect(result.newCommand.payload.replacesCommandId).toBe(
+      submitted.command.commandId,
+    );
+    expect(result.newCommand.commandId).not.toBe(submitted.command.commandId);
+    expect(result.events).toHaveLength(2);
+    expect(result.events[0].eventType).toBe("CommandSuperseded");
+    expect(result.events[0].causedBy).toBe("supersede");
+    expect(result.events[0].payload).toMatchObject({
+      newCommandId: result.newCommand.commandId,
+      reason: "safety override",
+    });
+    expect(result.events[1].eventType).toBe("CommandSubmitted");
+    expect(result.events[1].causedBy).toBe("supersede-replacement");
+    expect(result.events[1].commandId).toBe(result.newCommand.commandId);
+  });
+
+  it("supersedes a CLAIMED command and invalidates the old lease", () => {
+    const clock = new FakeClock();
+    const idGen = new FakeIdGen();
+    const submitted = createPendingCommand(makeSubmit(), null, idGen, clock);
+    const claimed = claimCommand(
+      submitted.command,
+      { gatewayId: "gw-old", leaseDurationMs: 5000 },
+      idGen,
+      clock,
+    );
+    const oldLease = claimed.command.currentLeaseId!;
+    clock.advance(10);
+    const result = supersedeCommand(
+      claimed.command,
+      {
+        oldCommandId: claimed.command.commandId,
+        idempotencyKey: "repl-2",
+        payload: { deviceId: "dev-1", action: "safe-state" },
+        reason: "override",
+      },
+      idGen,
+      clock,
+    );
+    expect(result.oldCommand.status).toBe("SUPERSEDED");
+    expect(result.oldCommand.currentLeaseId).toBeNull();
+    expect(result.events[0].payload).toMatchObject({
+      invalidatedLeaseId: oldLease,
+      invalidatedGatewayId: "gw-old",
+    });
+  });
+
+  it("rejects supersede of a SUCCEEDED command (cannot replace executed action)", () => {
+    const clock = new FakeClock();
+    const idGen = new FakeIdGen();
+    const submitted = createPendingCommand(makeSubmit(), null, idGen, clock);
+    const claimed = claimCommand(
+      submitted.command,
+      { gatewayId: "gw-1", leaseDurationMs: 5000 },
+      idGen,
+      clock,
+    );
+    const succeeded = confirmCommand(
+      claimed.command,
+      {
+        commandId: claimed.command.commandId,
+        leaseId: claimed.command.currentLeaseId!,
+        gatewayId: "gw-1",
+        confirmationCode: "ACK",
+        deviceTimestamp: clock.now(),
+      },
+      idGen,
+      clock,
+    );
+    expect(() =>
+      supersedeCommand(
+        succeeded.command,
+        {
+          oldCommandId: succeeded.command.commandId,
+          idempotencyKey: "repl-x",
+          payload: { deviceId: "dev-1", action: "stop" },
+          reason: "too late",
+        },
+        idGen,
+        clock,
+      ),
+    ).toThrow(CommandAlreadyCompletedError);
+  });
+
+  it("late confirmation from old gateway after supersede is rejected", () => {
+    const clock = new FakeClock();
+    const idGen = new FakeIdGen();
+    const submitted = createPendingCommand(makeSubmit(), null, idGen, clock);
+    const claimed = claimCommand(
+      submitted.command,
+      { gatewayId: "gw-old", leaseDurationMs: 5000 },
+      idGen,
+      clock,
+    );
+    const oldLease = claimed.command.currentLeaseId!;
+    const superseded = supersedeCommand(
+      claimed.command,
+      {
+        oldCommandId: claimed.command.commandId,
+        idempotencyKey: "repl-3",
+        payload: { deviceId: "dev-1", action: "stop" },
+        reason: "override",
+      },
+      idGen,
+      clock,
+    );
+    const lateConfirm = confirmCommand(
+      superseded.oldCommand,
+      {
+        commandId: claimed.command.commandId,
+        leaseId: oldLease,
+        gatewayId: "gw-old",
+        confirmationCode: "GHOST",
+        deviceTimestamp: clock.now(),
+      },
+      idGen,
+      clock,
+    );
+    expect(lateConfirm.command.status).toBe("SUPERSEDED");
+    expect(lateConfirm.events[0].eventType).toBe("StaleMessageRejected");
+    expect(lateConfirm.events[0].payload).toMatchObject({
+      finalStatus: "SUPERSEDED",
+    });
+  });
+
+  it("replacement command preserves stable execution identity chain via replacesCommandId", () => {
+    const clock = new FakeClock();
+    const idGen = new FakeIdGen();
+    const submitted = createPendingCommand(makeSubmit(), null, idGen, clock);
+    const result = supersedeCommand(
+      submitted.command,
+      {
+        oldCommandId: submitted.command.commandId,
+        idempotencyKey: "repl-chain",
+        payload: { deviceId: "dev-1", action: "safe" },
+        reason: "override",
+      },
+      idGen,
+      clock,
+    );
+    const claimed = claimCommand(
+      result.newCommand,
+      { gatewayId: "gw-new", leaseDurationMs: 5000 },
+      idGen,
+      clock,
+    );
+    expect(claimed.command.attempt).toBe(1);
+    expect(claimed.command.payload.replacesCommandId).toBe(
+      submitted.command.commandId,
+    );
+    expect(claimed.command.commandId).not.toBe(submitted.command.commandId);
   });
 });

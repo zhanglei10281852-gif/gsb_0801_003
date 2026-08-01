@@ -1,7 +1,6 @@
-import Database from 'better-sqlite3';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
-import fs from 'node:fs';
+import Database from "better-sqlite3";
+import path from "node:path";
+import fs from "node:fs";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS commands (
@@ -17,6 +16,8 @@ CREATE TABLE IF NOT EXISTS commands (
   confirmation_code TEXT,
   device_timestamp INTEGER,
   failure_reason TEXT,
+  cancel_reason TEXT,
+  superseded_by_command_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -39,21 +40,35 @@ CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status, lease_expires
 CREATE INDEX IF NOT EXISTS idx_commands_updated ON commands(updated_at);
 `;
 
+function migrate(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(commands)").all() as {
+    name: string;
+  }[];
+  const columnNames = new Set(columns.map((c) => c.name));
+  if (!columnNames.has("cancel_reason")) {
+    db.exec("ALTER TABLE commands ADD COLUMN cancel_reason TEXT");
+  }
+  if (!columnNames.has("superseded_by_command_id")) {
+    db.exec("ALTER TABLE commands ADD COLUMN superseded_by_command_id TEXT");
+  }
+}
+
 export function openDatabase(dbPath: string): Database.Database {
   const dir = path.dirname(dbPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
   const db = new Database(dbPath);
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = FULL');
-  db.pragma('foreign_keys = ON');
+  db.pragma("journal_mode = WAL");
+  db.pragma("synchronous = FULL");
+  db.pragma("foreign_keys = ON");
   db.exec(SCHEMA);
+  migrate(db);
   return db;
 }
 
 export function closeDatabase(db: Database.Database): void {
-  db.pragma('wal_checkpoint(TRUNCATE)');
+  db.pragma("wal_checkpoint(TRUNCATE)");
   db.close();
 }
 

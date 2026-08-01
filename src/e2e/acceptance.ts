@@ -865,6 +865,367 @@ async function scenarioTakeoverAuditCausality(
   });
 }
 
+async function scenarioWithdrawPending(server: ServerHandle): Promise<void> {
+  await test("withdraw pending: command becomes CANCELLED, not claimable, event chain queryable", async () => {
+    const api = new ApiClient(server.baseUrl);
+    const { body: submitted } = await api.submitCommand(
+      "e2e-withdraw-pending",
+      {
+        deviceId: "dev-wd-1",
+        action: "calibrate",
+      },
+    );
+
+    const withdrawRes = await api.withdraw(
+      submitted.commandId,
+      "operator abort",
+    );
+    assert.equal(withdrawRes.status, 200);
+    assert.ok(isCommand(withdrawRes.body), "withdraw should return a command");
+    assert.equal(withdrawRes.body.status, "CANCELLED");
+    assert.equal(withdrawRes.body.cancelReason, "operator abort");
+
+    const claimRes = await api.claim("gw-wd", 5000, "dev-wd-1");
+    assert.equal(
+      claimRes.status,
+      204,
+      "cancelled command must not be claimable",
+    );
+
+    const { body: eventsRes } = await api.getEvents(submitted.commandId);
+    const types = eventsRes.events.map((e) => e.eventType);
+    assert.deepEqual(types, ["CommandSubmitted", "CommandCancelled"]);
+    const cancelEvent = eventsRes.events[1];
+    assert.equal(cancelEvent.causedBy, "withdraw");
+    assert.ok(cancelEvent.payload?.reason, "operator abort");
+  });
+}
+
+async function scenarioWithdrawClaimed(server: ServerHandle): Promise<void> {
+  await test("withdraw claimed: lease invalidated, old gateway renew/confirm rejected and audited", async () => {
+    const api = new ApiClient(server.baseUrl);
+    const device = new DeviceSimulator("dev-wd-2", { dropConfirm: true });
+    const gw = new GatewaySimulator({
+      gatewayId: "gw-wd-2",
+      pollIntervalMs: 50,
+      leaseDurationMs: 10000,
+      renewIntervalMs: 10000,
+      api,
+      device,
+    });
+
+    const { body: submitted } = await api.submitCommand(
+      "e2e-withdraw-claimed",
+      {
+        deviceId: "dev-wd-2",
+        action: "calibrate",
+      },
+    );
+
+    gw.start();
+    await waitForStatus(api, submitted.commandId, "CLAIMED", 5000);
+    const held = gw.getHeldTask()!;
+    const oldLease = held.currentLeaseId!;
+
+    const withdrawRes = await api.withdraw(
+      submitted.commandId,
+      "emergency stop",
+    );
+    assert.equal(withdrawRes.status, 200);
+    assert.ok(isCommand(withdrawRes.body), "withdraw should return a command");
+    assert.equal(withdrawRes.body.status, "CANCELLED");
+    assert.equal(withdrawRes.body.currentLeaseId, null);
+
+    const renewRes = await api.renew({
+      commandId: submitted.commandId,
+      leaseId: oldLease,
+      gatewayId: "gw-wd-2",
+      leaseDurationMs: 5000,
+    });
+    assert.equal(
+      renewRes.status,
+      409,
+      "old gateway renew after withdraw must be rejected",
+    );
+
+    const { body: confirmRes } = await api.confirm({
+      commandId: submitted.commandId,
+      leaseId: oldLease,
+      gatewayId: "gw-wd-2",
+      confirmationCode: "LATE-ACK",
+      deviceTimestamp: Date.now(),
+    });
+    assert.equal(confirmRes.accepted, false);
+    assert.equal(confirmRes.command.status, "CANCELLED");
+
+    gw.stop();
+
+    const { body: eventsRes } = await api.getEvents(submitted.commandId);
+    const types = eventsRes.events.map((e) => e.eventType);
+    assert.ok(types.includes("CommandCancelled"));
+    assert.ok(
+      types.includes("LeaseOperationRejected"),
+      `renew rejection must be audited; got: ${types.join(",")}`,
+    );
+    assert.ok(types.includes("StaleMessageRejected"));
+  });
+}
+
+async function scenarioWithdrawAlreadySucceeded(
+  server: ServerHandle,
+): Promise<void> {
+  await test("withdraw succeeded: rejected with 409, executed action cannot be faked as cancelled", async () => {
+    const api = new ApiClient(server.baseUrl);
+    const device = new DeviceSimulator("dev-wd-3", { confirmDelayMs: 20 });
+    const gw = new GatewaySimulator({
+      gatewayId: "gw-wd-3",
+      pollIntervalMs: 50,
+      leaseDurationMs: 5000,
+      renewIntervalMs: 2000,
+      api,
+      device,
+    });
+
+    const { body: submitted } = await api.submitCommand("e2e-withdraw-done", {
+      deviceId: "dev-wd-3",
+      action: "calibrate",
+    });
+    gw.start();
+    await waitForStatus(api, submitted.commandId, "SUCCEEDED", 8000);
+    gw.stop();
+
+    const withdrawRes = await api.withdraw(submitted.commandId, "too late");
+    assert.equal(withdrawRes.status, 409);
+    assert.ok(
+      JSON.stringify(withdrawRes.body).includes("SUCCEEDED"),
+      "error must mention SUCCEEDED",
+    );
+
+    const final = await fetchCommand(api, submitted.commandId);
+    assert.equal(final.status, "SUCCEEDED");
+    assert.ok(final.confirmationCode, "confirmation must remain intact");
+  });
+}
+
+async function scenarioSupersede(server: ServerHandle): Promise<void> {
+  await test("supersede: old command SUPERSEDED, replacement delivered and confirmed, causal chain queryable", async () => {
+    const api = new ApiClient(server.baseUrl);
+    const oldDevice = new DeviceSimulator("dev-sup-1", { dropConfirm: true });
+    const oldGw = new GatewaySimulator({
+      gatewayId: "gw-sup-old",
+      pollIntervalMs: 50,
+      leaseDurationMs: 10000,
+      renewIntervalMs: 10000,
+      api,
+      device: oldDevice,
+    });
+
+    const { body: submitted } = await api.submitCommand("e2e-supersede", {
+      deviceId: "dev-sup-1",
+      action: "calibrate",
+      params: { mode: "A" },
+    });
+
+    oldGw.start();
+    await waitForStatus(api, submitted.commandId, "CLAIMED", 5000);
+    const oldHeld = oldGw.getHeldTask()!;
+    const oldLease = oldHeld.currentLeaseId!;
+
+    const supRes = await api.supersede(
+      submitted.commandId,
+      "e2e-supersede-replacement",
+      { deviceId: "dev-sup-1", action: "emergency-stop" },
+      "safety override: mode A unsafe",
+    );
+    assert.equal(supRes.status, 201);
+    const body = supRes.body as {
+      oldCommand: ApiCommand;
+      newCommand: ApiCommand;
+    };
+    assert.equal(body.oldCommand.status, "SUPERSEDED");
+    assert.equal(
+      body.oldCommand.supersededByCommandId,
+      body.newCommand.commandId,
+    );
+    assert.equal(body.newCommand.status, "PENDING");
+    assert.equal(
+      body.newCommand.payload.replacesCommandId,
+      submitted.commandId,
+    );
+
+    oldGw.stop();
+
+    const newDevice = new DeviceSimulator("dev-sup-1", { confirmDelayMs: 20 });
+    const newGw = new GatewaySimulator({
+      gatewayId: "gw-sup-new",
+      pollIntervalMs: 50,
+      leaseDurationMs: 5000,
+      renewIntervalMs: 2000,
+      api,
+      device: newDevice,
+    });
+    newGw.start();
+    const replacementFinal = await waitForStatus(
+      api,
+      body.newCommand.commandId,
+      "SUCCEEDED",
+      8000,
+    );
+    assert.equal(
+      replacementFinal.payload.replacesCommandId,
+      submitted.commandId,
+    );
+    newGw.stop();
+
+    const { body: oldEvents } = await api.getEvents(submitted.commandId);
+    const oldTypes = oldEvents.events.map((e) => e.eventType);
+    assert.ok(oldTypes.includes("CommandSuperseded"));
+    assert.ok(oldTypes.includes("CommandSubmitted"));
+    assert.ok(oldTypes.includes("CommandClaimed"));
+
+    const { body: newEvents } = await api.getEvents(body.newCommand.commandId);
+    const newTypes = newEvents.events.map((e) => e.eventType);
+    assert.deepEqual(newTypes, [
+      "CommandSubmitted",
+      "CommandClaimed",
+      "DeliveryReported",
+      "DeviceConfirmed",
+      "CommandSucceeded",
+    ]);
+    const submittedEvent = newEvents.events[0];
+    assert.equal(submittedEvent.causedBy, "supersede-replacement");
+    assert.equal(
+      (submittedEvent.payload as { replacesCommandId: string })
+        .replacesCommandId,
+      submitted.commandId,
+    );
+
+    const renewRes = await api.renew({
+      commandId: submitted.commandId,
+      leaseId: oldLease,
+      gatewayId: "gw-sup-old",
+      leaseDurationMs: 5000,
+    });
+    assert.equal(
+      renewRes.status,
+      409,
+      "old gateway renew after supersede must be rejected",
+    );
+  });
+}
+
+async function scenarioSupersedeAlreadySucceeded(
+  server: ServerHandle,
+): Promise<void> {
+  await test("supersede succeeded: rejected with 409, cannot replace executed action", async () => {
+    const api = new ApiClient(server.baseUrl);
+    const device = new DeviceSimulator("dev-sup-2", { confirmDelayMs: 20 });
+    const gw = new GatewaySimulator({
+      gatewayId: "gw-sup-2",
+      pollIntervalMs: 50,
+      leaseDurationMs: 5000,
+      renewIntervalMs: 2000,
+      api,
+      device,
+    });
+
+    const { body: submitted } = await api.submitCommand("e2e-sup-done", {
+      deviceId: "dev-sup-2",
+      action: "calibrate",
+    });
+    gw.start();
+    await waitForStatus(api, submitted.commandId, "SUCCEEDED", 8000);
+    gw.stop();
+
+    const supRes = await api.supersede(
+      submitted.commandId,
+      "e2e-sup-done-repl",
+      { deviceId: "dev-sup-2", action: "stop" },
+      "too late",
+    );
+    assert.equal(supRes.status, 409);
+
+    const final = await fetchCommand(api, submitted.commandId);
+    assert.equal(final.status, "SUCCEEDED");
+  });
+}
+
+async function scenarioCrashRecoveryWithSupersede(): Promise<void> {
+  await test("crash recovery: supersede survives restart, old gateway late confirm rejected, replacement proceeds", async () => {
+    const server = createManagedServer();
+    await server.start();
+    try {
+      const api = new ApiClient(server.baseUrl);
+      const device1 = new DeviceSimulator("dev-crash-sup", {
+        dropConfirm: true,
+      });
+      const gw1 = new GatewaySimulator({
+        gatewayId: "gw-crash-sup-1",
+        pollIntervalMs: 50,
+        leaseDurationMs: 1500,
+        renewIntervalMs: 10000,
+        api,
+        device: device1,
+      });
+
+      const { body: submitted } = await api.submitCommand("e2e-crash-sup", {
+        deviceId: "dev-crash-sup",
+        action: "calibrate",
+      });
+      gw1.start();
+      await waitForStatus(api, submitted.commandId, "CLAIMED", 5000);
+      const oldHeld = gw1.getHeldTask()!;
+      const oldLease = oldHeld.currentLeaseId!;
+      gw1.goOffline();
+
+      const supRes = await api.supersede(
+        submitted.commandId,
+        "e2e-crash-sup-repl",
+        { deviceId: "dev-crash-sup", action: "safe-stop" },
+        "override before crash",
+      );
+      assert.equal(supRes.status, 201);
+      const newCommandId = (supRes.body as { newCommand: ApiCommand })
+        .newCommand.commandId;
+
+      await server.restart();
+
+      const oldAfterRestart = await fetchCommand(api, submitted.commandId);
+      assert.equal(oldAfterRestart.status, "SUPERSEDED");
+      assert.equal(oldAfterRestart.supersededByCommandId, newCommandId);
+
+      const { body: lateConfirm } = await api.confirm({
+        commandId: submitted.commandId,
+        leaseId: oldLease,
+        gatewayId: "gw-crash-sup-1",
+        confirmationCode: "GHOST",
+        deviceTimestamp: Date.now(),
+      });
+      assert.equal(lateConfirm.accepted, false);
+      assert.equal(lateConfirm.command.status, "SUPERSEDED");
+
+      const device2 = new DeviceSimulator("dev-crash-sup", {
+        confirmDelayMs: 20,
+      });
+      const gw2 = new GatewaySimulator({
+        gatewayId: "gw-crash-sup-2",
+        pollIntervalMs: 50,
+        leaseDurationMs: 5000,
+        renewIntervalMs: 2000,
+        api,
+        device: device2,
+      });
+      gw2.start();
+      const final = await waitForStatus(api, newCommandId, "SUCCEEDED", 8000);
+      assert.equal(final.payload.replacesCommandId, submitted.commandId);
+      gw1.stop();
+      gw2.stop();
+    } finally {
+      await server.stop();
+    }
+  });
+}
+
 async function scenarioEventAuditTrail(server: ServerHandle): Promise<void> {
   await test("operations audit: every state transition has a causedBy event with timestamp and lease/attempt context", async () => {
     const api = new ApiClient(server.baseUrl);
@@ -914,6 +1275,12 @@ async function main(): Promise<void> {
     await scenarioSplitBrainOldGatewayWrites(server);
     await scenarioTakeoverAuditCausality(server);
     await scenarioProcessRestartDuringLease();
+    await scenarioWithdrawPending(server);
+    await scenarioWithdrawClaimed(server);
+    await scenarioWithdrawAlreadySucceeded(server);
+    await scenarioSupersede(server);
+    await scenarioSupersedeAlreadySucceeded(server);
+    await scenarioCrashRecoveryWithSupersede();
     await scenarioEventAuditTrail(server);
   } finally {
     await server.stop();
