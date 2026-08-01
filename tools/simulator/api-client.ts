@@ -55,13 +55,18 @@ export class ApiClient {
     gatewayId: string,
     commandId: string,
     leaseId: string,
+    generation: number,
     leaseDurationMs?: number
   ) {
     return this.request(
       'POST',
       `/v1/gateway/commands/${commandId}/renew`,
       leaseDurationMs ? { leaseDurationMs } : {},
-      { 'x-gateway-id': gatewayId, 'x-lease-id': leaseId }
+      {
+        'x-gateway-id': gatewayId,
+        'x-lease-id': leaseId,
+        'x-generation': String(generation),
+      }
     );
   }
 
@@ -69,11 +74,13 @@ export class ApiClient {
     gatewayId: string,
     commandId: string,
     leaseId: string,
+    generation: number,
     body: { ackCode?: string; success?: boolean; ackPayload?: Record<string, unknown> }
   ) {
     return this.request('POST', `/v1/gateway/commands/${commandId}/ack`, body, {
       'x-gateway-id': gatewayId,
       'x-lease-id': leaseId,
+      'x-generation': String(generation),
     });
   }
 

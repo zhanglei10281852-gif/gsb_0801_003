@@ -50,21 +50,22 @@ npm run simulate -- events
 ### 状态机
 
 ```text
-PENDING --claim(leaseId, attempt+1)--> CLAIMED
-CLAIMED --renew---------------------> CLAIMED
-CLAIMED --ack success----------------> DELIVERED (terminal)
-CLAIMED --ack failure/nack-----------> FAILED    (terminal)
-CLAIMED --lease expiry---------------> PENDING
-PENDING --max attempts or max age----> TIMED_OUT (terminal)
+PENDING --claim(leaseId, generation+1, attempt+1)--> CLAIMED
+CLAIMED --renew(matching generation)----------------> CLAIMED
+CLAIMED --ack success(matching generation)----------> DELIVERED (terminal)
+CLAIMED --ack failure/nack(matching generation)-----> FAILED    (terminal)
+CLAIMED --lease expiry------------------------------> PENDING
+PENDING --max attempts or max age-------------------> TIMED_OUT (terminal)
 ```
 
 关键设计：
 
-- `commandId` 在首次接受业务幂等键时生成并持久化，后续重复提交、网关失联重试、重新领取都沿用同一个稳定执行身份。
-- 每次网关领取生成新的 `leaseId`，网关必须在后续续约和确认中携带匹配的 `gatewayId + leaseId`。
+- `commandId` 在首次接受业务幂等键时生成并持久化，后续重复提交、网关失联重试、主备接管都沿用同一个稳定执行身份。已经发给设备的重试不会生成第二条业务指令。
+- **所有权代际 `generation`（fencing token）**：每次成功领取（包括首轮领取和接管后的重新领取）都会让该指令的 `generation` 单调加 1。同一产线挂两台冗余网关时，主网关心跳中断、租约到期后备用网关接管，旧主网关的代际立即过期。
+- 每次网关领取生成新的 `leaseId`，网关必须在后续续约和确认中同时携带匹配的 `gatewayId + leaseId + generation`。旧代际的续约和确认即使迟到，也会以 `STALE_GENERATION` 被拒绝，不能推进状态或复活终态。
 - 只有设备确认被写入事件存储后，状态才能进入 `DELIVERED` 或 `FAILED`。
-- 终态（`DELIVERED`、`FAILED`、`TIMED_OUT`）不可被迟到 ACK、重复 ACK、新的领取或旧租约复活。
-- 状态不仅保存最终值，还保存完整事件流；每个事件都有 `causedBy` 和 `causationId`，可解释状态变化因果。
+- 终态（`DELIVERED`、`FAILED`、`TIMED_OUT`）不可被迟到 ACK、重复 ACK、新的领取或旧租约/旧代际复活。
+- 状态不仅保存最终值，还保存完整事件流；每个事件都有 `causedBy` 和 `causationId`，`CommandClaimed` 记录新旧代际与新旧网关，`DeviceAckRecorded` 记录实际成功的代际，可还原一次接管前后的因果关系。
 
 ### 事件类型
 
@@ -117,12 +118,17 @@ Content-Type: application/json
 
 ```json
 {
-  "command": { "commandId": "...", "payload": { "type": "CALIBRATE" }, "attempt": 1 },
-  "lease": { "leaseId": "...", "expiresAt": 1780000000000 }
+  "command": {
+    "commandId": "...",
+    "payload": { "type": "CALIBRATE" },
+    "attempt": 1,
+    "generation": 1
+  },
+  "lease": { "leaseId": "...", "generation": 1, "expiresAt": 1780000000000 }
 }
 ```
 
-没有可领取任务时返回 `204`。
+没有可领取任务时返回 `204`。后续续约和确认必须原样回传 `leaseId` 和 `generation`。
 
 ### 网关续约
 
@@ -130,9 +136,10 @@ Content-Type: application/json
 POST /v1/gateway/commands/{commandId}/renew
 X-Gateway-Id: gw-1
 X-Lease-Id: <leaseId>
+X-Generation: 1
 ```
 
-只有当前匹配且未过期的租约可续约。
+只有当前匹配、未过期且代际一致的租约可续约。主备接管后，旧主网关用旧代际续约将返回 `STALE_GENERATION`。
 
 ### 网关回传设备确认
 
@@ -140,12 +147,13 @@ X-Lease-Id: <leaseId>
 POST /v1/gateway/commands/{commandId}/ack
 X-Gateway-Id: gw-1
 X-Lease-Id: <leaseId>
+X-Generation: 1
 Content-Type: application/json
 
 { "success": true, "ackCode": "EXECUTED", "ackPayload": { "result": "ok" } }
 ```
 
-`success: false` 会记录 `DeviceNackRecorded` 并进入 `FAILED`。
+确认必须携带领取时拿到的 `generation`。备用网关在租约到期后接管会生成更大的代际；旧主网关分区恢复后用旧代际发送的迟到确认会被以 `STALE_GENERATION` 拒绝，不能把状态推进为成功。`generation` 也可放在请求体中。`success: false` 会记录 `DeviceNackRecorded` 并进入 `FAILED`。
 
 ### 运维与测试辅助
 
@@ -157,17 +165,17 @@ Content-Type: application/json
 
 通过环境变量配置：
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `PORT` | `8080` | HTTP 端口 |
-| `HOST` | `127.0.0.1` | 监听地址 |
-| `EDGE_DB_PATH` | `./data/edge-commands.db` | SQLite 文件路径 |
-| `LEASE_DURATION_MS` | `30000` | 默认租约时长 |
-| `MAX_ATTEMPTS` | `3` | 最大投递尝试次数；0 表示不限制 |
-| `MAX_AGE_MS` | 未设置 | 指令最大存活时间，超过后进入 `TIMED_OUT` |
-| `SWEEP_INTERVAL_MS` | `5000` | 后台租约/超时扫描间隔 |
-| `CLAIM_BATCH_SIZE` | `20` | 单次领取扫描候选数 |
-| `FAULT_INJECTION` | `false` | 是否启用崩溃注入端点 |
+| 变量                | 默认值                    | 说明                                     |
+| ------------------- | ------------------------- | ---------------------------------------- |
+| `PORT`              | `8080`                    | HTTP 端口                                |
+| `HOST`              | `127.0.0.1`               | 监听地址                                 |
+| `EDGE_DB_PATH`      | `./data/edge-commands.db` | SQLite 文件路径                          |
+| `LEASE_DURATION_MS` | `30000`                   | 默认租约时长                             |
+| `MAX_ATTEMPTS`      | `3`                       | 最大投递尝试次数；0 表示不限制           |
+| `MAX_AGE_MS`        | 未设置                    | 指令最大存活时间，超过后进入 `TIMED_OUT` |
+| `SWEEP_INTERVAL_MS` | `5000`                    | 后台租约/超时扫描间隔                    |
+| `CLAIM_BATCH_SIZE`  | `20`                      | 单次领取扫描候选数                       |
+| `FAULT_INJECTION`   | `false`                   | 是否启用崩溃注入端点                     |
 
 ## 模拟器能复现的故障
 
@@ -176,20 +184,22 @@ Content-Type: application/json
 - `happy`：提交、领取、确认、成功。
 - `duplicate-submit`：同一业务幂等键重复提交，返回同一 `commandId`。
 - `lease-retry`：网关领取后失联，租约过期后另一网关重新领取，同一 `commandId` 的 `attempt` 增加，旧租约确认被拒绝。
+- `failover`：同产线双网关，主网关持有代际 1 时备用网关无法接管；主网关租约到期后备用网关以代际 2 接管，旧主网关的迟到续约与确认都被 `STALE_GENERATION` 隔离，最终只有代际 2 的确认被持久化为成功。
 - `duplicate-ack`：设备重复确认，第二次被拒绝。
 - `wrong-lease`：错误或乱序的 `leaseId` 无法续约或确认。
 - `nack`：设备否定确认进入 `FAILED`。
 
-端到端验收还会真实启动两个服务实例：第一个在提交事件持久化后、响应前崩溃；第二个复用同一 SQLite 文件重启，验证业务请求不会生成第二个设备动作。
+端到端验收还会真实启动多个服务实例：一个在提交事件持久化后、响应前崩溃并重启复用同一数据库；另一个在主网关领取代际 1 后重启进程，验证代际随 SQLite 持久化保留，备用网关重启后仍能以代际 2 接管并隔离旧代际迟到确认。
 
 ## 交付保证
 
 1. **业务请求幂等**：同一业务幂等键在服务崩溃、网络重试、HTTP 超时后重复提交，最终映射到同一个 `commandId`。
-2. **稳定执行身份**：重试和重新领取不创建新指令，只在同一 `commandId` 下增加 `attempt` 并生成新的租约事件。
-3. **确认即落盘**：只有 `DeviceAckRecorded` 或 `DeviceNackRecorded` 已进入 SQLite 事务，状态才会被标记为成功或失败。
-4. **终态不可复活**：成功、失败、超时后的迟到/重复/错误租约消息都会被拒绝。
-5. **因果可追溯**：每次投递、续约、过期、重试、确认和超时都作为事件保存，包含来源和因果关联。
-6. **本地可运行**：只需 Node.js 20、npm install 和 SQLite 文件，不依赖外部服务。
+2. **稳定执行身份**：重试、主备接管和重新领取不创建新指令，只在同一 `commandId` 下增加 `attempt` 并生成新的租约/代际事件。
+3. **代际隔离（fencing）**：每次接管使 `generation` 单调递增，旧网关的续约与确认因 `STALE_GENERATION` 被拒绝；进程重启后代际从 SQLite 恢复，旧代际不会因迟到消息复活指令。
+4. **确认即落盘**：只有携带当前代际的 `DeviceAckRecorded` 或 `DeviceNackRecorded` 已进入 SQLite 事务，状态才会被标记为成功或失败。
+5. **终态不可复活**：成功、失败、超时后的迟到/重复/错误租约或旧代际消息都会被拒绝。
+6. **因果可追溯**：每次投递、续约、过期、接管、重试、确认和超时都作为事件保存，`CommandClaimed` 记录新旧代际与网关，包含来源和因果关联。
+7. **本地可运行**：只需 Node.js 20、npm install 和 SQLite 文件，不依赖外部服务。
 
 ## 无法做到的语义和恢复边界
 

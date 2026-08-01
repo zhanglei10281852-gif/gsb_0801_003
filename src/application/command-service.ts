@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID } from "node:crypto";
 import {
   apply,
   decideAck,
@@ -9,13 +9,13 @@ import {
   replay,
   systemEventFactory,
   type EventFactory,
-} from '../domain/command.js';
+} from "../domain/command.js";
 import type {
   CommandPayload,
   CommandSnapshot,
   DomainEvent,
-} from '../domain/types.js';
-import { ConcurrencyError, type EventStore } from '../adapters/event-store.js';
+} from "../domain/types.js";
+import { ConcurrencyError, type EventStore } from "../adapters/event-store.js";
 
 export interface ServiceConfig {
   leaseDurationMs: number;
@@ -27,7 +27,7 @@ export interface ServiceConfig {
 
 export interface SubmitResult {
   commandId: string;
-  state: CommandSnapshot['state'];
+  state: CommandSnapshot["state"];
   duplicate: boolean;
   idempotencyKey: string;
   attempt: number;
@@ -49,7 +49,7 @@ export class CommandService {
   constructor(
     private readonly store: EventStore,
     private readonly config: ServiceConfig,
-    private readonly factory: EventFactory = systemEventFactory
+    private readonly factory: EventFactory = systemEventFactory,
   ) {}
 
   private withConcurrencyRetry<T>(fn: () => T): T {
@@ -77,7 +77,9 @@ export class CommandService {
     submittedAt?: number;
   }): SubmitResult {
     return this.withConcurrencyRetry(() => {
-      const existing = this.store.getSnapshotByIdempotencyKey(input.idempotencyKey);
+      const existing = this.store.getSnapshotByIdempotencyKey(
+        input.idempotencyKey,
+      );
       if (existing) {
         return {
           commandId: existing.commandId,
@@ -97,10 +99,10 @@ export class CommandService {
           payload: input.payload,
           submittedAt: input.submittedAt ?? this.factory.now(),
         },
-        this.factory
+        this.factory,
       );
       if (!decision.accepted) {
-        throw new Error(decision.reason ?? 'SUBMIT_REJECTED');
+        throw new Error(decision.reason ?? "SUBMIT_REJECTED");
       }
       const snapshot = replay(decision.events)!;
       this.store.append(commandId, 0, decision.events, snapshot);
@@ -126,7 +128,7 @@ export class CommandService {
     return this.store.listEvents({ commandId });
   }
 
-  listEvents(filter?: Parameters<EventStore['listEvents']>[0]): DomainEvent[] {
+  listEvents(filter?: Parameters<EventStore["listEvents"]>[0]): DomainEvent[] {
     return this.store.listEvents(filter);
   }
 
@@ -147,7 +149,9 @@ export class CommandService {
         limit: this.config.claimBatchSize ?? 10,
       });
       for (const candidate of candidates) {
-        const events = this.store.listEvents({ commandId: candidate.commandId });
+        const events = this.store.listEvents({
+          commandId: candidate.commandId,
+        });
         const state = replay(events);
         const leaseId = randomUUID();
         const decision = decideClaim(
@@ -155,17 +159,23 @@ export class CommandService {
           {
             gatewayId: input.gatewayId,
             leaseId,
-            leaseDurationMs: input.leaseDurationMs ?? this.config.leaseDurationMs,
+            leaseDurationMs:
+              input.leaseDurationMs ?? this.config.leaseDurationMs,
             claimedAt: now,
             maxAttempts: input.maxAttempts ?? this.config.maxAttempts,
           },
-          this.factory
+          this.factory,
         );
         if (!decision.accepted) {
           if (decision.events.length > 0) {
             try {
               const partial = replay(events.concat(decision.events));
-              this.store.append(candidate.commandId, state?.version ?? 0, decision.events, partial);
+              this.store.append(
+                candidate.commandId,
+                state?.version ?? 0,
+                decision.events,
+                partial,
+              );
             } catch {
               // ignore; another worker likely moved it; continue
             }
@@ -174,7 +184,12 @@ export class CommandService {
         }
         const snapshot = replay(events.concat(decision.events))!;
         try {
-          this.store.append(candidate.commandId, state?.version ?? 0, decision.events, snapshot);
+          this.store.append(
+            candidate.commandId,
+            state?.version ?? 0,
+            decision.events,
+            snapshot,
+          );
           return { command: snapshot, events: decision.events };
         } catch (err) {
           if (err instanceof ConcurrencyError) continue;
@@ -189,28 +204,43 @@ export class CommandService {
     commandId: string;
     gatewayId: string;
     leaseId: string;
+    generation: number;
     leaseDurationMs?: number;
     renewedAt?: number;
   }): OperationResult {
     return this.withConcurrencyRetry(() => {
       const events = this.store.listEvents({ commandId: input.commandId });
       const state = replay(events);
-      if (!state) return { accepted: false, reason: 'COMMAND_NOT_FOUND', events: [] };
+      if (!state)
+        return { accepted: false, reason: "COMMAND_NOT_FOUND", events: [] };
       const decision = decideRenew(
         state,
         {
           gatewayId: input.gatewayId,
           leaseId: input.leaseId,
+          generation: input.generation,
           leaseDurationMs: input.leaseDurationMs ?? this.config.leaseDurationMs,
           renewedAt: input.renewedAt ?? this.factory.now(),
         },
-        this.factory
+        this.factory,
       );
       if (!decision.accepted) {
-        return { accepted: false, reason: decision.reason, events: decision.events };
+        return {
+          accepted: false,
+          reason: decision.reason,
+          events: decision.events,
+        };
       }
-      const snapshot = apply(state, decision.events[decision.events.length - 1]);
-      this.store.append(input.commandId, state.version, decision.events, snapshot);
+      const snapshot = apply(
+        state,
+        decision.events[decision.events.length - 1],
+      );
+      this.store.append(
+        input.commandId,
+        state.version,
+        decision.events,
+        snapshot,
+      );
       return { accepted: true, snapshot, events: decision.events };
     });
   }
@@ -219,6 +249,7 @@ export class CommandService {
     commandId: string;
     gatewayId: string;
     leaseId: string;
+    generation: number;
     ackCode: string;
     success: boolean;
     ackPayload?: Record<string, unknown>;
@@ -227,24 +258,38 @@ export class CommandService {
     return this.withConcurrencyRetry(() => {
       const events = this.store.listEvents({ commandId: input.commandId });
       const state = replay(events);
-      if (!state) return { accepted: false, reason: 'COMMAND_NOT_FOUND', events: [] };
+      if (!state)
+        return { accepted: false, reason: "COMMAND_NOT_FOUND", events: [] };
       const decision = decideAck(
         state,
         {
           gatewayId: input.gatewayId,
           leaseId: input.leaseId,
+          generation: input.generation,
           ackCode: input.ackCode,
           ackPayload: input.ackPayload,
           success: input.success,
           receivedAt: input.receivedAt ?? this.factory.now(),
         },
-        this.factory
+        this.factory,
       );
       if (!decision.accepted) {
-        return { accepted: false, reason: decision.reason, events: decision.events };
+        return {
+          accepted: false,
+          reason: decision.reason,
+          events: decision.events,
+        };
       }
-      const snapshot = apply(state, decision.events[decision.events.length - 1]);
-      this.store.append(input.commandId, state.version, decision.events, snapshot);
+      const snapshot = apply(
+        state,
+        decision.events[decision.events.length - 1],
+      );
+      this.store.append(
+        input.commandId,
+        state.version,
+        decision.events,
+        snapshot,
+      );
       return { accepted: true, snapshot, events: decision.events };
     });
   }
@@ -256,7 +301,9 @@ export class CommandService {
     for (const candidate of candidates) {
       try {
         const result = this.withConcurrencyRetry(() => {
-          const events = this.store.listEvents({ commandId: candidate.commandId });
+          const events = this.store.listEvents({
+            commandId: candidate.commandId,
+          });
           const state = replay(events);
           const decision = decideExpire(
             state,
@@ -265,11 +312,16 @@ export class CommandService {
               maxAttempts: this.config.maxAttempts,
               maxAgeMs: this.config.maxAgeMs,
             },
-            this.factory
+            this.factory,
           );
           if (!decision.accepted || decision.events.length === 0) return [];
           const snapshot = replay(events.concat(decision.events));
-          this.store.append(candidate.commandId, state?.version ?? 0, decision.events, snapshot);
+          this.store.append(
+            candidate.commandId,
+            state?.version ?? 0,
+            decision.events,
+            snapshot,
+          );
           return decision.events;
         });
         produced.push(...result);

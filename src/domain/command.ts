@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID } from "node:crypto";
 import type {
   AckInput,
   ClaimInput,
@@ -8,7 +8,7 @@ import type {
   ExpireInput,
   RenewInput,
   SubmitCommandInput,
-} from './types.js';
+} from "./types.js";
 
 export interface EventFactory {
   nextId: () => string;
@@ -20,7 +20,7 @@ export const systemEventFactory: EventFactory = {
   now: () => Date.now(),
 };
 
-export function createEventFactory(prefix = 'evt'): EventFactory {
+export function createEventFactory(prefix = "evt"): EventFactory {
   let n = 0;
   return {
     nextId: () => `${prefix}-${++n}`,
@@ -34,46 +34,48 @@ export function initialState(): CommandSnapshot | undefined {
 
 export function apply(
   state: CommandSnapshot | undefined,
-  event: DomainEvent
+  event: DomainEvent,
 ): CommandSnapshot {
   switch (event.type) {
-    case 'CommandSubmitted':
+    case "CommandSubmitted":
       return {
         commandId: event.commandId,
         idempotencyKey: event.data.idempotencyKey as string,
         deviceId: event.data.deviceId as string,
-        payload: event.data.payload as CommandSnapshot['payload'],
-        state: 'PENDING',
+        payload: event.data.payload as CommandSnapshot["payload"],
+        state: "PENDING",
         version: event.version,
         attempt: 0,
+        generation: 0,
         createdAt: event.occurredAt,
         updatedAt: event.recordedAt,
       };
-    case 'CommandClaimed':
-      if (!state) throw new Error('invalid event stream');
+    case "CommandClaimed":
+      if (!state) throw new Error("invalid event stream");
       return {
         ...state,
-        state: 'CLAIMED',
+        state: "CLAIMED",
         version: event.version,
         attempt: event.data.attempt as number,
+        generation: event.data.generation as number,
         gatewayId: event.data.gatewayId as string,
         leaseId: event.data.leaseId as string,
         leaseExpiresAt: event.data.leaseExpiresAt as number,
         updatedAt: event.recordedAt,
       };
-    case 'LeaseRenewed':
-      if (!state) throw new Error('invalid event stream');
+    case "LeaseRenewed":
+      if (!state) throw new Error("invalid event stream");
       return {
         ...state,
         version: event.version,
         leaseExpiresAt: event.data.leaseExpiresAt as number,
         updatedAt: event.recordedAt,
       };
-    case 'LeaseExpired':
-      if (!state) throw new Error('invalid event stream');
+    case "LeaseExpired":
+      if (!state) throw new Error("invalid event stream");
       return {
         ...state,
-        state: 'PENDING',
+        state: "PENDING",
         version: event.version,
         attempt: event.data.attempt as number,
         gatewayId: undefined,
@@ -81,31 +83,31 @@ export function apply(
         leaseExpiresAt: undefined,
         updatedAt: event.recordedAt,
       };
-    case 'DeviceAckRecorded':
-      if (!state) throw new Error('invalid event stream');
+    case "DeviceAckRecorded":
+      if (!state) throw new Error("invalid event stream");
       return {
         ...state,
-        state: 'DELIVERED',
+        state: "DELIVERED",
         version: event.version,
         deliveredAt: event.occurredAt,
         terminalReason: event.data.ackCode as string,
         updatedAt: event.recordedAt,
       };
-    case 'DeviceNackRecorded':
-      if (!state) throw new Error('invalid event stream');
+    case "DeviceNackRecorded":
+      if (!state) throw new Error("invalid event stream");
       return {
         ...state,
-        state: 'FAILED',
+        state: "FAILED",
         version: event.version,
         deliveredAt: event.occurredAt,
         terminalReason: event.data.ackCode as string,
         updatedAt: event.recordedAt,
       };
-    case 'CommandTimedOut':
-      if (!state) throw new Error('invalid event stream');
+    case "CommandTimedOut":
+      if (!state) throw new Error("invalid event stream");
       return {
         ...state,
-        state: 'TIMED_OUT',
+        state: "TIMED_OUT",
         version: event.version,
         gatewayId: undefined,
         leaseId: undefined,
@@ -114,23 +116,26 @@ export function apply(
         updatedAt: event.recordedAt,
       };
     default:
-      if (!state) throw new Error('invalid event stream');
+      if (!state) throw new Error("invalid event stream");
       return { ...state, version: event.version, updatedAt: event.recordedAt };
   }
 }
 
 export function replay(events: DomainEvent[]): CommandSnapshot | undefined {
-  return events.reduce<CommandSnapshot | undefined>((s, e) => apply(s, e), undefined);
+  return events.reduce<CommandSnapshot | undefined>(
+    (s, e) => apply(s, e),
+    undefined,
+  );
 }
 
 function makeEvent(
   state: CommandSnapshot | undefined,
   type: string,
   data: Record<string, unknown>,
-  causedBy: DomainEvent['causedBy'],
+  causedBy: DomainEvent["causedBy"],
   occurredAt: number,
   factory: EventFactory,
-  causationId?: string
+  causationId?: string,
 ): DomainEvent {
   return {
     eventId: factory.nextId(),
@@ -146,97 +151,134 @@ function makeEvent(
 }
 
 function terminal(state: CommandSnapshot | undefined): boolean {
-  return state?.state === 'DELIVERED' || state?.state === 'FAILED' || state?.state === 'TIMED_OUT';
+  return (
+    state?.state === "DELIVERED" ||
+    state?.state === "FAILED" ||
+    state?.state === "TIMED_OUT"
+  );
 }
 
 export function decideSubmit(
   state: CommandSnapshot | undefined,
   input: SubmitCommandInput,
-  factory: EventFactory
+  factory: EventFactory,
 ): Decision {
   if (state) {
     if (state.idempotencyKey === input.idempotencyKey) {
-      return { accepted: true, events: [], result: { duplicate: true, commandId: state.commandId, state: state.state } };
+      return {
+        accepted: true,
+        events: [],
+        result: {
+          duplicate: true,
+          commandId: state.commandId,
+          state: state.state,
+        },
+      };
     }
-    return { accepted: false, events: [], reason: 'IDEMPOTENCY_KEY_CONFLICT' };
+    return { accepted: false, events: [], reason: "IDEMPOTENCY_KEY_CONFLICT" };
   }
   const event = makeEvent(
     undefined,
-    'CommandSubmitted',
+    "CommandSubmitted",
     {
       commandId: input.commandId,
       idempotencyKey: input.idempotencyKey,
       deviceId: input.deviceId,
       payload: input.payload,
     },
-    'SUBMIT',
+    "SUBMIT",
     input.submittedAt,
     factory,
-    input.idempotencyKey
+    input.idempotencyKey,
   );
-  return { accepted: true, events: [event], result: { duplicate: false, commandId: input.commandId } };
+  return {
+    accepted: true,
+    events: [event],
+    result: { duplicate: false, commandId: input.commandId },
+  };
 }
 
 export function decideClaim(
   state: CommandSnapshot | undefined,
   input: ClaimInput,
-  factory: EventFactory
+  factory: EventFactory,
 ): Decision {
-  if (!state) return { accepted: false, events: [], reason: 'COMMAND_NOT_FOUND' };
-  if (terminal(state)) return { accepted: false, events: [], reason: `TERMINAL_${state.state}` };
+  if (!state)
+    return { accepted: false, events: [], reason: "COMMAND_NOT_FOUND" };
+  if (terminal(state))
+    return { accepted: false, events: [], reason: `TERMINAL_${state.state}` };
 
   const events: DomainEvent[] = [];
   let current = state;
 
-  if (current.state === 'CLAIMED' && current.leaseExpiresAt! > input.claimedAt) {
-    return { accepted: false, events: [], reason: 'LEASE_ACTIVE' };
+  if (
+    current.state === "CLAIMED" &&
+    current.leaseExpiresAt! > input.claimedAt
+  ) {
+    return { accepted: false, events: [], reason: "LEASE_ACTIVE" };
   }
 
-  if (current.state === 'CLAIMED' && current.leaseExpiresAt! <= input.claimedAt) {
+  if (
+    current.state === "CLAIMED" &&
+    current.leaseExpiresAt! <= input.claimedAt
+  ) {
     const expired = makeEvent(
       current,
-      'LeaseExpired',
-      { attempt: current.attempt, oldLeaseId: current.leaseId, gatewayId: current.gatewayId },
-      'LEASE_EXPIRY',
+      "LeaseExpired",
+      {
+        attempt: current.attempt,
+        generation: current.generation,
+        oldLeaseId: current.leaseId,
+        oldGatewayId: current.gatewayId,
+      },
+      "LEASE_EXPIRY",
       current.leaseExpiresAt!,
       factory,
-      current.leaseId
+      current.leaseId,
     );
     events.push(expired);
     current = apply(current, expired);
   }
 
-  if (current.state !== 'PENDING') {
-    return { accepted: false, events, reason: `INVALID_STATE_${current.state}` };
+  if (current.state !== "PENDING") {
+    return {
+      accepted: false,
+      events,
+      reason: `INVALID_STATE_${current.state}`,
+    };
   }
 
   if (input.maxAttempts > 0 && current.attempt >= input.maxAttempts) {
     const timedOut = makeEvent(
       current,
-      'CommandTimedOut',
-      { reason: 'MAX_ATTEMPTS_REACHED', attempt: current.attempt },
-      'TIMEOUT',
+      "CommandTimedOut",
+      { reason: "MAX_ATTEMPTS_REACHED", attempt: current.attempt },
+      "TIMEOUT",
       input.claimedAt,
-      factory
+      factory,
     );
     events.push(timedOut);
-    return { accepted: false, events, reason: 'MAX_ATTEMPTS_REACHED' };
+    return { accepted: false, events, reason: "MAX_ATTEMPTS_REACHED" };
   }
 
   const attempt = current.attempt + 1;
+  const generation = current.generation + 1;
   const claimed = makeEvent(
     current,
-    'CommandClaimed',
+    "CommandClaimed",
     {
       attempt,
+      generation,
+      previousGeneration: state.generation,
       gatewayId: input.gatewayId,
+      previousGatewayId: state.gatewayId ?? null,
       leaseId: input.leaseId,
       leaseExpiresAt: input.claimedAt + input.leaseDurationMs,
     },
-    'CLAIM',
+    "CLAIM",
     input.claimedAt,
     factory,
-    input.leaseId
+    input.leaseId,
   );
   events.push(claimed);
   current = apply(current, claimed);
@@ -246,25 +288,31 @@ export function decideClaim(
 export function decideRenew(
   state: CommandSnapshot | undefined,
   input: RenewInput,
-  factory: EventFactory
+  factory: EventFactory,
 ): Decision {
-  if (!state) return { accepted: false, events: [], reason: 'COMMAND_NOT_FOUND' };
-  if (terminal(state)) return { accepted: false, events: [], reason: `TERMINAL_${state.state}` };
-  if (state.state !== 'CLAIMED') return { accepted: false, events: [], reason: 'NOT_CLAIMED' };
+  if (!state)
+    return { accepted: false, events: [], reason: "COMMAND_NOT_FOUND" };
+  if (terminal(state))
+    return { accepted: false, events: [], reason: `TERMINAL_${state.state}` };
+  if (state.state !== "CLAIMED")
+    return { accepted: false, events: [], reason: "NOT_CLAIMED" };
   if (state.gatewayId !== input.gatewayId || state.leaseId !== input.leaseId) {
-    return { accepted: false, events: [], reason: 'LEASE_MISMATCH' };
+    return { accepted: false, events: [], reason: "LEASE_MISMATCH" };
+  }
+  if (input.generation !== state.generation) {
+    return { accepted: false, events: [], reason: "STALE_GENERATION" };
   }
   if (state.leaseExpiresAt! <= input.renewedAt) {
-    return { accepted: false, events: [], reason: 'LEASE_EXPIRED' };
+    return { accepted: false, events: [], reason: "LEASE_EXPIRED" };
   }
   const event = makeEvent(
     state,
-    'LeaseRenewed',
+    "LeaseRenewed",
     { leaseExpiresAt: input.renewedAt + input.leaseDurationMs },
-    'RENEW',
+    "RENEW",
     input.renewedAt,
     factory,
-    input.leaseId
+    input.leaseId,
   );
   return { accepted: true, events: [event] };
 }
@@ -272,23 +320,34 @@ export function decideRenew(
 export function decideAck(
   state: CommandSnapshot | undefined,
   input: AckInput & { success: boolean },
-  factory: EventFactory
+  factory: EventFactory,
 ): Decision {
-  if (!state) return { accepted: false, events: [], reason: 'COMMAND_NOT_FOUND' };
-  if (terminal(state)) return { accepted: false, events: [], reason: `TERMINAL_${state.state}` };
-  if (state.state !== 'CLAIMED') return { accepted: false, events: [], reason: 'NOT_CLAIMED' };
+  if (!state)
+    return { accepted: false, events: [], reason: "COMMAND_NOT_FOUND" };
+  if (terminal(state))
+    return { accepted: false, events: [], reason: `TERMINAL_${state.state}` };
+  if (state.state !== "CLAIMED")
+    return { accepted: false, events: [], reason: "NOT_CLAIMED" };
   if (state.gatewayId !== input.gatewayId || state.leaseId !== input.leaseId) {
-    return { accepted: false, events: [], reason: 'LEASE_MISMATCH' };
+    return { accepted: false, events: [], reason: "LEASE_MISMATCH" };
   }
-  const type = input.success ? 'DeviceAckRecorded' : 'DeviceNackRecorded';
+  if (input.generation !== state.generation) {
+    return { accepted: false, events: [], reason: "STALE_GENERATION" };
+  }
+  const type = input.success ? "DeviceAckRecorded" : "DeviceNackRecorded";
   const event = makeEvent(
     state,
     type,
-    { ackCode: input.ackCode, ackPayload: input.ackPayload ?? null },
-    'ACK',
+    {
+      ackCode: input.ackCode,
+      ackPayload: input.ackPayload ?? null,
+      generation: input.generation,
+      gatewayId: input.gatewayId,
+    },
+    "ACK",
     input.receivedAt,
     factory,
-    input.leaseId
+    input.leaseId,
   );
   return { accepted: true, events: [event] };
 }
@@ -296,47 +355,61 @@ export function decideAck(
 export function decideExpire(
   state: CommandSnapshot | undefined,
   input: ExpireInput,
-  factory: EventFactory
+  factory: EventFactory,
 ): Decision {
-  if (!state) return { accepted: false, events: [], reason: 'COMMAND_NOT_FOUND' };
-  if (terminal(state)) return { accepted: false, events: [], reason: `TERMINAL_${state.state}` };
+  if (!state)
+    return { accepted: false, events: [], reason: "COMMAND_NOT_FOUND" };
+  if (terminal(state))
+    return { accepted: false, events: [], reason: `TERMINAL_${state.state}` };
 
   const events: DomainEvent[] = [];
   let current = state;
 
-  const ageExpired = input.maxAgeMs !== undefined && input.now - current.createdAt >= input.maxAgeMs;
+  const ageExpired =
+    input.maxAgeMs !== undefined &&
+    input.now - current.createdAt >= input.maxAgeMs;
 
-  if (current.state === 'CLAIMED' && (current.leaseExpiresAt! <= input.now || ageExpired)) {
+  if (
+    current.state === "CLAIMED" &&
+    (current.leaseExpiresAt! <= input.now || ageExpired)
+  ) {
     const expired = makeEvent(
       current,
-      'LeaseExpired',
-      { attempt: current.attempt, oldLeaseId: current.leaseId, gatewayId: current.gatewayId },
-      'LEASE_EXPIRY',
+      "LeaseExpired",
+      {
+        attempt: current.attempt,
+        generation: current.generation,
+        oldLeaseId: current.leaseId,
+        oldGatewayId: current.gatewayId,
+      },
+      "LEASE_EXPIRY",
       Math.min(current.leaseExpiresAt!, input.now),
       factory,
-      current.leaseId
+      current.leaseId,
     );
     events.push(expired);
     current = apply(current, expired);
   }
 
-  if (current.state === 'PENDING') {
-    const attemptsExhausted = input.maxAttempts > 0 && current.attempt >= input.maxAttempts;
+  if (current.state === "PENDING") {
+    const attemptsExhausted =
+      input.maxAttempts > 0 && current.attempt >= input.maxAttempts;
     if (attemptsExhausted || ageExpired) {
-      const reason = ageExpired ? 'MAX_AGE_REACHED' : 'MAX_ATTEMPTS_REACHED';
+      const reason = ageExpired ? "MAX_AGE_REACHED" : "MAX_ATTEMPTS_REACHED";
       const timedOut = makeEvent(
         current,
-        'CommandTimedOut',
+        "CommandTimedOut",
         { reason, attempt: current.attempt },
-        'TIMEOUT',
+        "TIMEOUT",
         input.now,
-        factory
+        factory,
       );
       events.push(timedOut);
       current = apply(current, timedOut);
     }
   }
 
-  if (events.length === 0) return { accepted: false, events: [], reason: 'NOT_DUE' };
+  if (events.length === 0)
+    return { accepted: false, events: [], reason: "NOT_DUE" };
   return { accepted: true, events, result: { state: current.state } };
 }
