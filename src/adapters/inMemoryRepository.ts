@@ -1,15 +1,16 @@
 /**
  * In-memory repository for deterministic tests. Mirrors the SQLite adapter's
  * semantics: unique idempotency key, atomic (all-or-nothing) transactions via a
- * snapshot/rollback, and insertion-ordered events.
+ * snapshot/rollback, insertion-ordered events, and persisted line ownership.
  */
 
-import { Command, DomainEvent } from '../domain/types';
+import { Command, DomainEvent, LineOwnership } from '../domain/types';
 import { Repository, RepoTx } from '../ports';
 
 export class InMemoryRepository implements Repository {
   private commands = new Map<string, Command>();
   private byKey = new Map<string, string>(); // idempotencyKey -> id
+  private ownership = new Map<string, LineOwnership>(); // lineId -> record
   private events: DomainEvent[] = [];
   private inTx = false;
 
@@ -21,6 +22,7 @@ export class InMemoryRepository implements Repository {
     // Snapshot for rollback on throw (keeps the "atomic" contract honest).
     const cmdSnap = new Map(this.commands);
     const keySnap = new Map(this.byKey);
+    const ownSnap = new Map(this.ownership);
     const evtSnapLen = this.events.length;
     const tx = new MemTx(this);
     try {
@@ -30,6 +32,7 @@ export class InMemoryRepository implements Repository {
     } catch (err) {
       this.commands = cmdSnap;
       this.byKey = keySnap;
+      this.ownership = ownSnap;
       this.events.length = evtSnapLen;
       this.inTx = false;
       throw err;
@@ -68,6 +71,14 @@ export class InMemoryRepository implements Repository {
     return id ? (this.commands.get(id) ?? null) : null;
   }
 
+  _getOwnership(lineId: string): LineOwnership | null {
+    return this.ownership.get(lineId) ?? null;
+  }
+
+  _putOwnership(o: LineOwnership): void {
+    this.ownership.set(o.lineId, o);
+  }
+
   // --- read side (Repository) ---
   getById(id: string): Command | null {
     return this._get(id);
@@ -77,8 +88,8 @@ export class InMemoryRepository implements Repository {
     return this._getByKey(key);
   }
 
-  eventsFor(id: string): DomainEvent[] {
-    return this.events.filter((e) => e.commandId === id);
+  eventsFor(subjectId: string): DomainEvent[] {
+    return this.events.filter((e) => e.subjectId === subjectId);
   }
 
   recentEvents(limit: number): DomainEvent[] {
@@ -93,30 +104,49 @@ export class InMemoryRepository implements Repository {
     return all.slice(0, limit);
   }
 
-  findPendingIds(deviceId: string | undefined, limit: number): string[] {
+  findPendingIds(
+    filter: { lineId?: string; deviceId?: string },
+    limit: number,
+  ): string[] {
     return [...this.commands.values()]
       .filter(
         (c) =>
           c.status === 'PENDING' &&
-          (deviceId === undefined || c.payload.deviceId === deviceId),
+          (filter.lineId === undefined || c.lineId === filter.lineId) &&
+          (filter.deviceId === undefined || c.payload.deviceId === filter.deviceId),
       )
       .sort((a, b) => a.createdAt - b.createdAt)
       .slice(0, limit)
       .map((c) => c.id);
   }
 
-  findExpiredLeaseIds(now: number, limit: number, deviceId?: string): string[] {
+  findExpiredLeaseIds(
+    now: number,
+    limit: number,
+    filter: { lineId?: string; deviceId?: string } = {},
+  ): string[] {
     return [...this.commands.values()]
       .filter(
         (c) =>
           c.status === 'LEASED' &&
           c.leaseExpiresAt !== null &&
           c.leaseExpiresAt <= now &&
-          (deviceId === undefined || c.payload.deviceId === deviceId),
+          (filter.lineId === undefined || c.lineId === filter.lineId) &&
+          (filter.deviceId === undefined || c.payload.deviceId === filter.deviceId),
       )
       .sort((a, b) => (a.leaseExpiresAt ?? 0) - (b.leaseExpiresAt ?? 0))
       .slice(0, limit)
       .map((c) => c.id);
+  }
+
+  getOwnership(lineId: string): LineOwnership | null {
+    return this._getOwnership(lineId);
+  }
+
+  listOwnership(): LineOwnership[] {
+    return [...this.ownership.values()].sort((a, b) =>
+      a.lineId.localeCompare(b.lineId),
+    );
   }
 
   close(): void {
@@ -140,5 +170,11 @@ class MemTx implements RepoTx {
   }
   appendEvents(events: DomainEvent[]): void {
     this.repo._append(events);
+  }
+  getOwnership(lineId: string): LineOwnership | null {
+    return this.repo._getOwnership(lineId);
+  }
+  putOwnership(o: LineOwnership): void {
+    this.repo._putOwnership(o);
   }
 }

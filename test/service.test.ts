@@ -36,6 +36,7 @@ function makeService(clock = new ManualClock(), maxAttempts = 3) {
   const svc = new DispatchService(repo, clock, new SeqIds(), {
     leaseDurationMs: 1000,
     maxAttempts,
+    ownershipTtlMs: 5000,
   });
   return { repo, svc, clock };
 }
@@ -59,7 +60,9 @@ test('lease -> confirm success reaches SUCCEEDED with one execution identity', (
   const lease = svc.leaseNext('gw1');
   assert.ok(lease);
   assert.equal(lease!.executionId, sub.command.id);
-  const conf = svc.confirm(lease!.command.id, lease!.leaseId, 'success', 'rcpt1');
+  const conf = svc.confirm(lease!.command.id, lease!.leaseId, 'success', {
+    deviceReceipt: 'rcpt1',
+  });
   assert.equal(conf.accepted, true);
   assert.equal(svc.getById(sub.command.id)!.status, 'SUCCEEDED');
 });

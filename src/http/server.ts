@@ -6,17 +6,20 @@
  *
  * Routes:
  *   Upstream (scheduling system):
- *     POST /commands                 submit (idempotent by idempotencyKey)
+ *     POST /commands                 submit (idempotent by idempotencyKey; optional lineId)
  *     GET  /commands/:id             query by internal id
  *     GET  /commands?key=...         query by idempotency key
  *     GET  /commands/:id/events      causal history of one command
- *   Gateway (edge):
- *     POST /gateway/lease            { leaseholder } -> next task or 204
- *     POST /gateway/renew            { commandId, leaseId }
- *     POST /gateway/confirm          { commandId, leaseId, outcome, deviceReceipt? }
+ *   Gateway (edge, redundant):
+ *     POST /gateway/ownership        { lineId, gateway } -> claim/heartbeat/takeover
+ *     POST /gateway/lease            { leaseholder, lineId?, deviceId?, generation? } -> task or 204
+ *     POST /gateway/renew            { commandId, leaseId, generation? }
+ *     POST /gateway/confirm          { commandId, leaseId, outcome, deviceReceipt?, generation? }
  *   Ops:
  *     GET  /ops/commands             list (optional ?status=)
- *     GET  /ops/events               recent events across all commands
+ *     GET  /ops/events               recent events across all subjects
+ *     GET  /ops/ownership            current line ownership records
+ *     GET  /ops/lines/:lineId/events causal history of one line's ownership
  *     POST /ops/sweep                force an expiry sweep (also runs periodically)
  *     GET  /healthz
  */
@@ -69,6 +72,16 @@ function str(v: unknown, field: string): string {
   return v;
 }
 
+/** Optional non-negative integer field (e.g. ownership generation). */
+function optInt(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.floor(v) : null;
+}
+
+/** Optional string field. */
+function optStr(v: unknown): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+
 export function createHttpServer(service: DispatchService): Server {
   return createServer((req, res) => {
     handle(service, req, res).catch((err) => {
@@ -112,6 +125,7 @@ async function handle(
           : {},
       maxAttempts:
         typeof body.maxAttempts === 'number' ? body.maxAttempts : undefined,
+      lineId: optStr(body.lineId),
     });
     // 200 for dedup replay, 201 for a freshly created command.
     return send(res, result.deduped ? 200 : 201, {
@@ -143,23 +157,59 @@ async function handle(
     });
   }
 
+  // --- ops: current line ownership ---
+  if (method === 'GET' && path === '/ops/ownership') {
+    return send(res, 200, { ownership: service.listOwnership() });
+  }
+
+  // --- ops: one line's ownership causal history ---
+  const lineEvMatch = /^\/ops\/lines\/([^/]+)\/events$/.exec(path);
+  if (method === 'GET' && lineEvMatch) {
+    const lineId = decodeURIComponent(lineEvMatch[1]!);
+    return send(res, 200, { lineId, events: service.history(lineId) });
+  }
+
   // --- ops: force sweep ---
   if (method === 'POST' && path === '/ops/sweep') {
     return send(res, 200, service.sweepExpired());
+  }
+
+  // --- gateway: claim/heartbeat/takeover line ownership ---
+  if (method === 'POST' && path === '/gateway/ownership') {
+    const body = await readJson(req);
+    const lineId = str(body.lineId, 'lineId');
+    const gateway = str(body.gateway, 'gateway');
+    const result = service.claimOwnership(lineId, gateway);
+    // A rejected claim (healthy owner present) is a 409; otherwise 200 with the
+    // authoritative generation the gateway must stamp on subsequent operations.
+    const status = result.outcome === 'rejected' ? 409 : 200;
+    return send(res, status, {
+      outcome: result.outcome,
+      reason: result.reason,
+      lineId: result.ownership.lineId,
+      owner: result.ownership.owner,
+      generation: result.ownership.generation,
+      expiresAt: result.ownership.expiresAt,
+    });
   }
 
   // --- gateway: lease next ---
   if (method === 'POST' && path === '/gateway/lease') {
     const body = await readJson(req);
     const leaseholder = str(body.leaseholder, 'leaseholder');
-    // Optional: restrict to a device this gateway serves.
-    const deviceId = typeof body.deviceId === 'string' ? body.deviceId : undefined;
-    const result = service.leaseNext(leaseholder, deviceId);
+    const result = service.leaseNext(leaseholder, {
+      lineId: optStr(body.lineId),
+      deviceId: optStr(body.deviceId),
+      callerGeneration: optInt(body.generation),
+    });
     if (!result) return send(res, 204, null);
     return send(res, 200, {
       commandId: result.command.id,
       executionId: result.executionId,
       leaseId: result.leaseId,
+      lineId: result.command.lineId,
+      ownerGeneration: result.ownerGeneration,
+      preempted: result.preempted,
       payload: result.command.payload,
       leaseExpiresAt: result.command.leaseExpiresAt,
       attempt: result.command.attempts,
@@ -172,6 +222,7 @@ async function handle(
     const result = service.renew(
       str(body.commandId, 'commandId'),
       str(body.leaseId, 'leaseId'),
+      optInt(body.generation),
     );
     return send(res, result.renewed ? 200 : 409, {
       renewed: result.renewed,
@@ -192,7 +243,10 @@ async function handle(
       str(body.commandId, 'commandId'),
       str(body.leaseId, 'leaseId'),
       outcome as ConfirmOutcome,
-      typeof body.deviceReceipt === 'string' ? body.deviceReceipt : undefined,
+      {
+        deviceReceipt: optStr(body.deviceReceipt),
+        callerGeneration: optInt(body.generation),
+      },
     );
     return send(res, result.accepted ? 200 : 409, {
       accepted: result.accepted,

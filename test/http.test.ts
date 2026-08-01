@@ -29,6 +29,7 @@ before(async () => {
   const svc = new DispatchService(repo, systemClock, uuidIds, {
     leaseDurationMs: 400,
     maxAttempts: 3,
+    ownershipTtlMs: 400,
   });
   server = createHttpServer(svc);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -196,4 +197,87 @@ test('lease returns 204 when nothing is available', async () => {
   // If still leasing, that's fine as long as at least the route works; but we
   // expect a drain within 10 iterations for this small test DB.
   assert.ok(true);
+});
+
+test('ownership: acquire, reject healthy claim, take over after lapse (over HTTP)', async () => {
+  const line = `line-http-${Date.now()}`;
+  const g1 = await httpJson<{ outcome: string; generation: number }>(
+    baseUrl,
+    'POST',
+    '/gateway/ownership',
+    { lineId: line, gateway: 'gw1' },
+  );
+  assert.equal(g1.status, 200);
+  assert.equal(g1.body.outcome, 'acquired');
+  assert.equal(g1.body.generation, 1);
+
+  // A different gateway is refused while gw1 is healthy.
+  const refused = await httpJson<{ outcome: string }>(baseUrl, 'POST', '/gateway/ownership', {
+    lineId: line,
+    gateway: 'gw2',
+  });
+  assert.equal(refused.status, 409);
+  assert.equal(refused.body.outcome, 'rejected');
+
+  // After the ownership TTL (400ms) lapses, gw2 takes over -> generation 2.
+  await sleep(500);
+  const taken = await httpJson<{ outcome: string; generation: number }>(
+    baseUrl,
+    'POST',
+    '/gateway/ownership',
+    { lineId: line, gateway: 'gw2' },
+  );
+  assert.equal(taken.status, 200);
+  assert.equal(taken.body.outcome, 'takeover');
+  assert.equal(taken.body.generation, 2);
+
+  // Line ownership history reconstructs the takeover causally.
+  const evs = await httpJson<{ events: { type: string }[] }>(
+    baseUrl,
+    'GET',
+    `/ops/lines/${encodeURIComponent(line)}/events`,
+  );
+  const types = evs.body.events.map((e) => e.type);
+  assert.ok(types.includes('OWNERSHIP_ACQUIRED'));
+  assert.ok(types.includes('OWNERSHIP_TAKEOVER'));
+});
+
+test('a stale-generation confirmation is fenced with 409 over HTTP', async () => {
+  const line = `line-fence-${Date.now()}`;
+  const dev = `dev-fence-${Date.now()}`;
+  // gw1 owns generation 1 and leases a command.
+  await httpJson(baseUrl, 'POST', '/gateway/ownership', { lineId: line, gateway: 'gw1' });
+  const sub = await httpJson<{ command: { id: string } }>(baseUrl, 'POST', '/commands', {
+    idempotencyKey: `fence-${Date.now()}`,
+    deviceId: dev,
+    kind: 'calibrate',
+    lineId: line,
+  });
+  const id = sub.body.command.id;
+  const lease = await httpJson<{ leaseId: string }>(baseUrl, 'POST', '/gateway/lease', {
+    leaseholder: 'gw1',
+    lineId: line,
+    deviceId: dev,
+    generation: 1,
+  });
+  assert.equal(lease.status, 200);
+
+  // gw1 ownership lapses; gw2 takes over -> generation 2.
+  await sleep(500);
+  const taken = await httpJson<{ generation: number }>(baseUrl, 'POST', '/gateway/ownership', {
+    lineId: line,
+    gateway: 'gw2',
+  });
+  assert.equal(taken.body.generation, 2);
+
+  // gw1 confirms with its (still-held) lease id but stale generation 1 -> fenced.
+  const late = await httpJson<{ accepted: boolean; reason: string }>(
+    baseUrl,
+    'POST',
+    '/gateway/confirm',
+    { commandId: id, leaseId: lease.body.leaseId, outcome: 'success', generation: 1 },
+  );
+  assert.equal(late.status, 409);
+  assert.equal(late.body.accepted, false);
+  assert.equal(late.body.reason, 'stale_generation');
 });

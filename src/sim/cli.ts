@@ -13,6 +13,13 @@
  *                    gateway finishes it, still one device action
  *   stale-confirm    a late confirmation from an expired lease is ignored
  *   duplicate-confirm at-least-once confirm relay is idempotent
+ *   takeover         primary owns a line and vanishes; standby takes over (代际++),
+ *                    finishes the work; still one device action
+ *   split-brain      partitioned old primary keeps its stale generation; after a
+ *                    standby takes over, the old primary can neither lease nor
+ *                    push a confirmation through (fenced by generation)
+ *   ownership-expiry a standby is refused while the primary is healthy, then
+ *                    allowed to take over once the primary's heartbeat lapses
  *
  * The upstream idempotency key is time-seeded so repeated CLI runs against a
  * persistent DB do not collide.
@@ -52,12 +59,13 @@ async function submit(
   deviceId: string,
   kind: string,
   params: Record<string, unknown> = {},
+  lineId?: string,
 ) {
   return httpJson<{ command: { id: string; status: string }; deduped: boolean }>(
     url,
     'POST',
     '/commands',
-    { idempotencyKey: key, deviceId, kind, params },
+    { idempotencyKey: key, deviceId, kind, params, lineId },
   );
 }
 
@@ -204,7 +212,9 @@ const scenarios: Record<string, Scenario> = {
     await forceSweep(args.url); // command goes back to PENDING (requeued)
 
     // Late confirmation with the now-stale lease id must be rejected.
-    const late = await gw.confirmRaw(id, staleLeaseId, 'success', 'rcpt_late');
+    const late = await gw.confirmRaw(id, staleLeaseId, 'success', {
+      receipt: 'rcpt_late',
+    });
     log('late confirm result', late);
 
     const after = await getCommand(args.url, id);
@@ -230,6 +240,172 @@ const scenarios: Record<string, Scenario> = {
     const after = await getCommand(args.url, id);
     const ok = after.body.command.status === 'SUCCEEDED' && device.distinctActions === 1;
     log('final status', after.body.command.status);
+    log('PASS', ok);
+    return ok;
+  },
+
+  // --- redundant-gateway scenarios ---
+
+  async takeover(args) {
+    const stamp = Date.now();
+    const line = `line-takeover-${stamp}`;
+    const dev = `dev-takeover-${stamp}`;
+    const key = `takeover-${stamp}`;
+    // Primary and standby share ONE physical device (they serve the same line).
+    const device = new SimDevice(dev);
+    const primary = new SimGateway(args.url, 'gw-primary', device, line);
+    const standby = new SimGateway(args.url, 'gw-standby', device, line);
+    process.stdout.write(
+      '[takeover] primary owns line, leases + vanishes; standby takes over (代际++) and finishes\n',
+    );
+
+    const own1 = await primary.acquireOwnership();
+    log('primary acquired ownership', { generation: own1.generation });
+    const s = await submit(args.url, key, dev, 'calibrate', {}, line);
+    const id = s.body.command.id;
+
+    // Primary leases the task then vanishes (no confirm, no heartbeat).
+    const v = await primary.pumpOnce({ vanishAfterLease: true });
+    log('primary leased then vanished', { executionId: v.executionId });
+
+    // Standby cannot take over yet (primary ownership still healthy)...
+    const early = await standby.acquireOwnership();
+    log('standby early claim (expect rejected)', {
+      outcome: early.outcome,
+      generation: early.generation,
+    });
+
+    // ...wait for the ownership heartbeat to lapse, then take over.
+    await sleep(args.leaseMs + 300); // ownership TTL is set == leaseMs in e2e
+    const own2 = await standby.acquireOwnership();
+    log('standby takeover', { outcome: own2.outcome, generation: own2.generation });
+
+    // Reap the primary's expired per-command lease, then standby finishes it.
+    await forceSweep(args.url);
+    const done = await standby.pumpOnce();
+    log('standby handled', {
+      executionId: done.executionId,
+      duplicate: done.device?.duplicate,
+      distinctActions: device.distinctActions,
+    });
+
+    const after = await getCommand(args.url, id);
+    const ok =
+      early.outcome === 'rejected' &&
+      own2.outcome === 'takeover' &&
+      own2.generation === own1.generation + 1 &&
+      after.body.command.status === 'SUCCEEDED' &&
+      v.executionId === done.executionId && // stable identity across takeover
+      device.distinctActions === 1; // acted exactly once
+    log('final status', after.body.command.status);
+    log('PASS', ok);
+    return ok;
+  },
+
+  async 'split-brain'(args) {
+    const stamp = Date.now();
+    const line = `line-split-${stamp}`;
+    const dev = `dev-split-${stamp}`;
+    const key = `split-${stamp}`;
+    const device = new SimDevice(dev);
+    const oldPrimary = new SimGateway(args.url, 'gw-old', device, line);
+    const standby = new SimGateway(args.url, 'gw-new', device, line);
+    process.stdout.write(
+      '[split-brain] partitioned old primary keeps stale generation; fenced after takeover\n',
+    );
+
+    const own1 = await oldPrimary.acquireOwnership();
+    const s = await submit(args.url, key, dev, 'calibrate', {}, line);
+    const id = s.body.command.id;
+
+    // Old primary leases the task (generation 1) and drives the device, but the
+    // network partitions BEFORE it can confirm. Capture its lease id.
+    const leased = await oldPrimary.pumpOnce({ dropConfirm: true });
+    log('old primary leased + acted, confirm lost', {
+      generation: own1.generation,
+      distinctActions: device.distinctActions,
+    });
+    const staleLeaseId = leased.leaseId!;
+
+    // Meanwhile its heartbeat lapses and the standby takes over (generation 2).
+    await sleep(args.leaseMs + 300);
+    const own2 = await standby.acquireOwnership();
+    log('standby takeover', { outcome: own2.outcome, generation: own2.generation });
+
+    // The partition heals. The OLD primary, still believing it holds generation
+    // 1 and its lease, tries to (a) lease more work and (b) push its confirm.
+    // Both must be fenced by generation.
+    oldPrimary.forceGeneration(own1.generation); // it never learned it lost
+    const staleLease = await httpJson<{ commandId?: string }>(
+      args.url,
+      'POST',
+      '/gateway/lease',
+      { leaseholder: 'gw-old', lineId: line, deviceId: dev, generation: own1.generation },
+    );
+    log('old primary lease attempt (expect 204 fenced)', { status: staleLease.status });
+
+    const staleConfirm = await oldPrimary.confirmRaw(id, staleLeaseId, 'success', {
+      generation: own1.generation,
+      receipt: 'rcpt_old',
+    });
+    log('old primary confirm attempt (expect rejected)', staleConfirm);
+
+    // The new owner reaps + finishes the command legitimately.
+    await forceSweep(args.url);
+    const done = await standby.pumpOnce();
+    log('standby completed', { duplicate: done.device?.duplicate });
+
+    const after = await getCommand(args.url, id);
+    const ok =
+      own2.generation === own1.generation + 1 &&
+      staleLease.status === 204 && // old generation could not lease
+      !staleConfirm.accepted && // old generation confirm fenced
+      staleConfirm.reason === 'stale_generation' &&
+      after.body.command.status === 'SUCCEEDED' &&
+      device.distinctActions === 1; // device acted exactly once despite the mess
+    log('final status', after.body.command.status);
+    log('PASS', ok);
+    return ok;
+  },
+
+  async 'ownership-expiry'(args) {
+    const stamp = Date.now();
+    const line = `line-ownexp-${stamp}`;
+    const dev = `dev-ownexp-${stamp}`;
+    const device = new SimDevice(dev);
+    const primary = new SimGateway(args.url, 'gw-p', device, line);
+    const standby = new SimGateway(args.url, 'gw-s', device, line);
+    process.stdout.write(
+      '[ownership-expiry] standby refused while primary healthy, allowed after heartbeat lapses\n',
+    );
+
+    const own1 = await primary.acquireOwnership();
+    log('primary owns', { generation: own1.generation });
+
+    // Standby tries immediately: must be rejected (primary healthy).
+    const refused = await standby.acquireOwnership();
+    log('standby claim while healthy (expect rejected)', {
+      outcome: refused.outcome,
+    });
+
+    // Primary heartbeats once to prove renew keeps generation stable.
+    const hb = await primary.acquireOwnership();
+    log('primary heartbeat', { outcome: hb.outcome, generation: hb.generation });
+
+    // Let the heartbeat lapse, then standby may take over.
+    await sleep(args.leaseMs + 300);
+    const taken = await standby.acquireOwnership();
+    log('standby takeover after lapse', {
+      outcome: taken.outcome,
+      generation: taken.generation,
+    });
+
+    const ok =
+      refused.outcome === 'rejected' &&
+      hb.outcome === 'renewed' &&
+      hb.generation === own1.generation &&
+      taken.outcome === 'takeover' &&
+      taken.generation === own1.generation + 1;
     log('PASS', ok);
     return ok;
   },

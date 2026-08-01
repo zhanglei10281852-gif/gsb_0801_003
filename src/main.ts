@@ -28,11 +28,13 @@ function main(): void {
   const leaseDurationMs = intEnv('LEASE_MS', 10_000);
   const maxAttempts = intEnv('MAX_ATTEMPTS', 5);
   const sweepIntervalMs = intEnv('SWEEP_MS', 1_000);
+  const ownershipTtlMs = intEnv('OWNERSHIP_TTL_MS', 15_000);
 
   const repo = new SqliteRepository(dbFile);
   const service = new DispatchService(repo, systemClock, uuidIds, {
     leaseDurationMs,
     maxAttempts,
+    ownershipTtlMs,
   });
   const server = createHttpServer(service);
 
@@ -50,7 +52,8 @@ function main(): void {
   server.listen(port, () => {
     process.stdout.write(
       `edge-dispatch listening on :${port} ` +
-        `(db=${dbFile}, leaseMs=${leaseDurationMs}, maxAttempts=${maxAttempts})\n`,
+        `(db=${dbFile}, leaseMs=${leaseDurationMs}, maxAttempts=${maxAttempts}, ` +
+        `ownershipTtlMs=${ownershipTtlMs})\n`,
     );
   });
 

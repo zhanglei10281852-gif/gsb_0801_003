@@ -38,6 +38,9 @@ function startServer(): ChildProcess {
       LEASE_MS: String(LEASE_MS),
       MAX_ATTEMPTS: '5',
       SWEEP_MS: '500',
+      // Ownership heartbeat TTL == per-command lease so the redundant-gateway
+      // scenarios can lapse both with a single wait of ~LEASE_MS.
+      OWNERSHIP_TTL_MS: String(LEASE_MS),
     },
     stdio: ['ignore', 'inherit', 'inherit'],
   });
@@ -147,6 +150,56 @@ async function crashRecoveryCheck(): Promise<boolean> {
   return ok;
 }
 
+/**
+ * Ownership generation must survive a process restart: after a takeover bumps
+ * the generation and the server is hard-killed and restarted, the persisted
+ * generation is unchanged, and an old-generation confirmation is still fenced.
+ */
+async function ownershipRecoveryCheck(): Promise<boolean> {
+  process.stdout.write('\n=== ownership-recovery check ===\n');
+  const line = `line-recover-${Date.now()}`;
+  let server = startServer();
+  await waitForHealth();
+
+  // gen 1: primary acquires; then let it lapse and standby takes over -> gen 2.
+  const g1 = await httpJson<{ generation: number }>(BASE_URL, 'POST', '/gateway/ownership', {
+    lineId: line,
+    gateway: 'gw-primary',
+  });
+  await sleep(LEASE_MS + 300);
+  const g2 = await httpJson<{ generation: number; outcome: string }>(
+    BASE_URL,
+    'POST',
+    '/gateway/ownership',
+    { lineId: line, gateway: 'gw-standby' },
+  );
+  process.stdout.write(
+    `  before crash: gen1=${g1.body.generation}, takeover gen=${g2.body.generation} (${g2.body.outcome})\n`,
+  );
+
+  process.stdout.write('  hard-killing server (SIGKILL)\n');
+  await stopServer(server, 'SIGKILL');
+
+  // Restart against the same DB; generation must be preserved.
+  server = startServer();
+  await waitForHealth();
+  const own = await httpJson<{ ownership: { lineId: string; generation: number }[] }>(
+    BASE_URL,
+    'GET',
+    '/ops/ownership',
+  );
+  const rec = own.body.ownership.find((o) => o.lineId === line);
+  const preserved = rec?.generation === g2.body.generation;
+  process.stdout.write(
+    `  after restart: generation=${rec?.generation} (expected ${g2.body.generation}), preserved=${preserved}\n`,
+  );
+
+  await stopServer(server);
+  const ok = g2.body.outcome === 'takeover' && g2.body.generation === g1.body.generation + 1 && preserved;
+  process.stdout.write(`  ownership-recovery PASS=${ok}\n`);
+  return ok;
+}
+
 async function main(): Promise<void> {
   cleanupDb();
   const scenarios = [
@@ -156,6 +209,9 @@ async function main(): Promise<void> {
     'vanish',
     'stale-confirm',
     'duplicate-confirm',
+    'takeover',
+    'split-brain',
+    'ownership-expiry',
   ];
 
   process.stdout.write(`starting compiled server on ${BASE_URL} (db=${dbFile})\n`);
@@ -182,6 +238,10 @@ async function main(): Promise<void> {
   const recovered = await crashRecoveryCheck();
   results['crash-recovery'] = recovered;
   allOk = allOk && recovered;
+
+  const ownRecovered = await ownershipRecoveryCheck();
+  results['ownership-recovery'] = ownRecovered;
+  allOk = allOk && ownRecovered;
 
   process.stdout.write('\n=== ACCEPTANCE SUMMARY ===\n');
   for (const [name, ok] of Object.entries(results)) {

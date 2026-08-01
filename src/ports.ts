@@ -5,7 +5,7 @@
  * deterministically with fakes.
  */
 
-import { Command, DomainEvent } from './domain/types';
+import { Command, DomainEvent, LineOwnership } from './domain/types';
 
 /** Injected clock so tests can advance time by hand. */
 export interface Clock {
@@ -38,19 +38,31 @@ export interface Repository {
   getById(id: string): Command | null;
   /** Read a command by upstream idempotency key (outside a transaction). */
   getByIdempotencyKey(key: string): Command | null;
-  /** All events for a command, in insertion order. */
-  eventsFor(id: string): DomainEvent[];
-  /** Recent events across all commands, newest first. */
+  /** All events for a subject (command id OR line id), in insertion order. */
+  eventsFor(subjectId: string): DomainEvent[];
+  /** Recent events across all subjects, newest first. */
   recentEvents(limit: number): DomainEvent[];
   /** Snapshot list of commands (optionally filtered by status). */
   listCommands(status?: Command['status'], limit?: number): Command[];
   /**
-   * Ids of PENDING commands, oldest first, optionally filtered by device.
-   * Used by the lease path to find the next available task.
+   * Ids of PENDING commands, oldest first, optionally filtered by line and/or
+   * device. Used by the lease path to find the next available task.
    */
-  findPendingIds(deviceId: string | undefined, limit: number): string[];
+  findPendingIds(
+    filter: { lineId?: string; deviceId?: string },
+    limit: number,
+  ): string[];
   /** Ids of commands whose lease has expired as of `now`. */
-  findExpiredLeaseIds(now: number, limit: number, deviceId?: string): string[];
+  findExpiredLeaseIds(
+    now: number,
+    limit: number,
+    filter?: { lineId?: string; deviceId?: string },
+  ): string[];
+
+  /** Read a line's ownership record (outside a transaction). */
+  getOwnership(lineId: string): LineOwnership | null;
+  /** Snapshot list of all line ownership records. */
+  listOwnership(): LineOwnership[];
 
   close(): void;
 }
@@ -65,4 +77,9 @@ export interface RepoTx {
   update(command: Command): void;
   /** Append causal events. */
   appendEvents(events: DomainEvent[]): void;
+
+  /** Read a line's ownership record inside the transaction. */
+  getOwnership(lineId: string): LineOwnership | null;
+  /** Insert or overwrite a line's ownership record (upsert). */
+  putOwnership(ownership: LineOwnership): void;
 }
